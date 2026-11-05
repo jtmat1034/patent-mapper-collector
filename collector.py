@@ -607,9 +607,59 @@ def build():
 
 # --- commands -----------------------------------------------------------------------------------------
 
+def shape(o, depth=0):
+    """Compact description of a JSON value's structure."""
+    if depth > 3:
+        return "..."
+    if isinstance(o, dict):
+        return "{" + ", ".join("%s: %s" % (k, shape(v, depth + 1)) for k, v in list(o.items())[:25]) + "}"
+    if isinstance(o, list):
+        return "[%d x %s]" % (len(o), shape(o[0], depth + 1) if o else "-")
+    if isinstance(o, str):
+        return "str(%d)%s" % (len(o), repr(o[:40]))
+    return type(o).__name__ + ":" + repr(o)[:30]
+
+
+def describe_zip(zpath, depth=0):
+    """Log what is actually inside an archive, so the reader can be fixed."""
+    with zipfile.ZipFile(zpath) as z:
+        infos = z.infolist()
+        log("  %sarchive: %d members" % ("  " * depth, len(infos)))
+        for i in infos[:8]:
+            log("  %s  %s  %d bytes" % ("  " * depth, i.filename, i.file_size))
+        for i in infos[:2]:
+            if i.is_dir():
+                continue
+            data = z.read(i.filename)
+            if i.filename.lower().endswith(".zip") and depth < 2:
+                p = zpath + ".inner.zip"
+                with open(p, "wb") as f:
+                    f.write(data)
+                describe_zip(p, depth + 1)
+                os.remove(p)
+                continue
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            log("  %s  first bytes of %s: %r" % ("  " * depth, i.filename, data[:1500]))
+            try:
+                log("  %s  JSON shape: %s" % ("  " * depth, shape(json.loads(data))))
+            except ValueError:
+                lines = data.splitlines()
+                try:
+                    log("  %s  JSON-lines shape (line 1 of %d): %s" % ("  " * depth, len(lines), shape(json.loads(lines[0]))))
+                except (ValueError, IndexError):
+                    log("  %s  not JSON" % ("  " * depth))
+
+
 def cmd_test(cfg):
     log("TEST 1/3: API key")
+    d = get_json("%s/api/v1/datasets/products/OACT?includeFiles=true&offset=0&limit=100" % API, cfg) or {}
+    bag = (d.get("bulkDataProductBag") or [{}])[0]
+    log("  product fields:", sorted(bag.keys()), "| file bag fields:", sorted((bag.get("productFileBag") or {}).keys()),
+        "| count:", (bag.get("productFileBag") or {}).get("count"), "| totals:",
+        {k: v for k, v in bag.items() if "count" in k.lower() or "total" in k.lower()})
     files = product_files("OACT", cfg)
+    log("  oldest file:", files[0]["fileName"] if files else "-")
     log("  OK - office action archive lists %d files, newest %s" % (len(files), files[-1]["fileName"] if files else "-"))
     log("TEST 2/3: one office-action file (format + labels)")
     f = files[-1]
@@ -627,6 +677,8 @@ def cmd_test(cfg):
     log("  ", json.dumps(counts))
     for e in examples:
         log("  example:", json.dumps(e)[:600])
+    if not counts.get("kept"):
+        describe_zip(z)
     os.remove(z)
     if not counts.get("kept"):
         raise SystemExit("No usable office actions found in the test file - send this output to Claude.")
