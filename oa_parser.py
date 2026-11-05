@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 6  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 7  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 
@@ -29,7 +29,7 @@ STATEMENT_REFS = re.compile(r"(?:unpatentable\s+over|obvious\s+over|anticipated\
 REF_SPLIT = re.compile(r"\b(?:further\s+)?in\s+view\s+of\b|\band\s+(?:further\s+)?(?:in\s+view\s+of\s+)?(?=[A-Z])|;|"
                        r"\bas\s+evidenced\s+by\b", re.I)
 # 'Yanagawa '451' style shorthand
-SHORT = re.compile(r"([A-Z][A-Za-z'\-]+)\s*[‘’'`]\s*(\d{3})\b")
+SHORT = re.compile(r"([^\W\d_][\w'\-]+)\s*[‘’'`]\s*(\d{3})\b")
 
 # --- claim sections -------------------------------------------------------------------
 
@@ -89,8 +89,20 @@ STOP_WORDS = {"us", "u", "s", "pgpub", "pg", "pub", "publication", "patent", "pa
               "reference", "rejected", "under", "u.s.c", "usc", "is", "are", "which", "with", "to", "art",
               "english", "translation", "equivalent", "its", "machine", "family", "member", "counterpart",
               "corresponding", "version", "aia", "fig", "figs", "figure", "para", "paragraph", "col", "column"}
-CAP = re.compile(r"[A-Z][A-Za-z'\-]+")
-ALIAS = re.compile(r"^[^)\n]{0,40}?hereinafter\s*[\"“‘']?\s*([A-Z][A-Za-z'\-]+)", re.I)
+CAP_WORD = r"(?:(?!\d)[^\W_](?<![a-z\u00df-\u00ff])[\w'\-]+)"
+CAP_RAW = re.compile(CAP_WORD)
+
+
+class _Cap:
+    """Capitalised words in any script (Arıkan, Müller, Ødegaard)."""
+
+    @staticmethod
+    def finditer(text):
+        return (m for m in CAP_RAW.finditer(text) if m.group(0)[0].isupper())
+
+
+CAP = _Cap()
+ALIAS = re.compile(r"^[^)\n]{0,40}?hereinafter\s*[\"“‘']?\s*([^\W\d_][\w'\-]+)", re.I)
 
 
 def surname_before(text, pos):
@@ -310,7 +322,7 @@ def cut_at_next_claim(seg, claims, head_end):
     return seg
 
 
-NAMEISH = re.compile(r"\b([A-Z][A-Za-z]{2,}\d*)\b")
+NAMEISH = re.compile(r"\b((?!\d)[^\W_][^\W\d_]{2,}\d*)\b")
 NOT_NAMES = {"see", "fig", "figs", "figure", "figures", "para", "paragraph", "paragraphs", "par", "col", "column",
              "lines", "line", "page", "element", "elements", "item", "step", "steps", "table", "abstract",
              "claim", "claims", "also", "note", "and", "e.g", "i.e", "examiner", "emphasis", "added", "id",
@@ -323,6 +335,8 @@ def unknown_name_before(seg, pos, by_name):
     cut = max(window.rfind("("), window.rfind(";"), window.rfind("."))
     window = window[cut + 1:] if cut >= 0 else window
     for m in NAMEISH.finditer(window):
+        if not m.group(1)[0].isupper():
+            continue
         w = m.group(1).lower()
         if w in NOT_NAMES or w in by_name:
             continue
