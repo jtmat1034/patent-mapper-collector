@@ -138,34 +138,53 @@ def run_oact(store, st, cfg, tmp):
         if time_left() < max(900, 3 * avg):
             break
         t0 = time.time()
-        z = os.path.join(tmp, f["fileName"])
-        C.download(f["fileDownloadURI"], z, cfg)
-        out = os.path.join(tmp, "labels_" + f["fileName"] + ".jsonl.gz")
-        samp = os.path.join(tmp, "samples_" + f["fileName"] + ".jsonl.gz")
-        evp = os.path.join(tmp, "events_" + f["fileName"] + ".jsonl.gz")
-        counts, n_s = {}, 0
-        with gzip.open(out, "wt") as g, gzip.open(samp, "wt") as gs, gzip.open(evp, "wt") as ge:
-            for obj in C.json_members(z):
-                for rec in C.oa_records(obj):
-                    app, date, code, _ = C.oa_event(rec)
-                    if app and date and C.substantive(code):
-                        ge.write(json.dumps([app, date, code]) + "\n")
-                    row, why = C.oa_row(rec)
-                    counts[why] = counts.get(why, 0) + 1
-                    if row:
-                        g.write(json.dumps(row) + "\n")
-                        if n_s < 20:
-                            t = rec.get("oaText") or rec.get("bodyText")
-                            gs.write(json.dumps({"app": row["app"], "date": row["date"], "row": row,
-                                                 "text": "\n".join(t) if isinstance(t, list) else t}) + "\n")
-                            n_s += 1
-        os.remove(z)
-        pending["work/labels/%s.jsonl.gz" % f["fileName"]] = out
-        pending["work/samples/%s.jsonl.gz" % f["fileName"]] = samp
-        pending["work/events/%s.jsonl.gz" % f["fileName"]] = evp
-        st["oact_done"].append(f["fileName"])
-        avg = 0.7 * avg + 0.3 * (time.time() - t0)
-        C.log("[OA] %s %s (%.0fs)" % (f["fileName"], json.dumps(counts), time.time() - t0))
+        try:
+            z = os.path.join(tmp, f["fileName"])
+            C.download(f["fileDownloadURI"], z, cfg)
+            out = os.path.join(tmp, "labels_" + f["fileName"] + ".jsonl.gz")
+            samp = os.path.join(tmp, "samples_" + f["fileName"] + ".jsonl.gz")
+            evp = os.path.join(tmp, "events_" + f["fileName"] + ".jsonl.gz")
+            counts, n_s = {}, 0
+            with gzip.open(out, "wt") as g, gzip.open(samp, "wt") as gs, gzip.open(evp, "wt") as ge:
+                for obj in C.json_members(z):
+                    for rec in C.oa_records(obj):
+                        try:
+                            app, date, code, _ = C.oa_event(rec)
+                            if app and date and C.substantive(code):
+                                ge.write(json.dumps([app, date, code]) + "\n")
+                            row, why = C.oa_row(rec)
+                        except Exception:  # anything unreadable: drop this office action, keep going
+                            row, why = None, "unreadable"
+                        counts[why] = counts.get(why, 0) + 1
+                        if row:
+                            g.write(json.dumps(row) + "\n")
+                            if n_s < 20:
+                                t = rec.get("oaText") or rec.get("bodyText")
+                                gs.write(json.dumps({"app": row["app"], "date": row["date"], "row": row,
+                                                     "text": "\n".join(t) if isinstance(t, list) else t}) + "\n")
+                                n_s += 1
+            os.remove(z)
+            pending["work/labels/%s.jsonl.gz" % f["fileName"]] = out
+            pending["work/samples/%s.jsonl.gz" % f["fileName"]] = samp
+            pending["work/events/%s.jsonl.gz" % f["fileName"]] = evp
+            st["oact_done"].append(f["fileName"])
+            avg = 0.7 * avg + 0.3 * (time.time() - t0)
+            C.log("[OA] %s %s (%.0fs)" % (f["fileName"], json.dumps(counts), time.time() - t0))
+        except Exception as e:  # the whole weekly file is unreadable: skip it for good, never retry in a loop
+            C.log("[OA] SKIPPED %s: %s" % (f["fileName"], str(e)[:300]))
+            for x in (os.path.join(tmp, f["fileName"]), os.path.join(tmp, "labels_" + f["fileName"] + ".jsonl.gz"),
+                      os.path.join(tmp, "samples_" + f["fileName"] + ".jsonl.gz"),
+                      os.path.join(tmp, "events_" + f["fileName"] + ".jsonl.gz")):
+                if os.path.exists(x):
+                    os.remove(x)
+            for k in ("labels", "samples", "events"):
+                pending.pop("work/%s/%s.jsonl.gz" % (k, f["fileName"]), None)
+            st["oact_done"].append(f["fileName"])
+            nd = re.search(r"(\d{4}-\d\d-\d\d)", f["fileName"])
+            d0 = (f.get("fileDataFromDate") or (nd.group(1) if nd else "") or "0000-00-00")[:10]
+            d1 = (f.get("fileDataToDate") or (nd.group(1) if nd else "") or "9999-99-99")[:10]
+            st.setdefault("oact_skipped", []).append([f["fileName"], d0, d1])
+            continue
         if len(pending) >= 2 * COMMIT_EVERY:
             pending["state/state.json"] = state_file(st, tmp)
             store.put(pending, "office actions through %s" % f["fileName"])
@@ -181,6 +200,9 @@ def run_oact(store, st, cfg, tmp):
 
 # --- stage 2 ------------------------------------------------------------------------------------
 
+STATE_SKIPPED = [None]  # skipped office-action files, set by run_appxml from the state
+
+
 def label_db(store, tmp):
     """All office-action labels in a local SQLite table: earliest action per application."""
     paths = store.get_prefix("work/labels/", os.path.join(tmp, "dl"))
@@ -189,7 +211,10 @@ def label_db(store, tmp):
     for p in paths:
         with gzip.open(p, "rt") as f:
             for line in f:
-                r = json.loads(line)
+                try:
+                    r = json.loads(line); r["app"], r["date"]
+                except Exception:
+                    continue
                 old = db.execute("SELECT date FROM a WHERE app=?", (r["app"],)).fetchone()
                 if old is None or r["date"] < old[0]:
                     db.execute("INSERT OR REPLACE INTO a VALUES (?,?,?)", (r["app"], r["date"], line))
@@ -200,11 +225,20 @@ def label_db(store, tmp):
     for p in store.get_prefix("work/events/", os.path.join(tmp, "dl")):
         with gzip.open(p, "rt") as f:
             for line in f:
-                app, date, _ = json.loads(line)
+                try:
+                    app, date, _ = json.loads(line)
+                except Exception:
+                    continue
                 if app not in first or date < first[app]:
                     first[app] = date
         os.remove(p)
     stale = [app for app, date in db.execute("SELECT app, date FROM a") if first.get(app, date) < date]
+    skipped = STATE_SKIPPED[0] or []
+    if skipped:  # a skipped weekly file could hide an earlier action: drop every application it could affect
+        for app, date, row in db.execute("SELECT app, date, row FROM a").fetchall():
+            filed = json.loads(row).get("filed") or ""
+            if any(filed <= (x[2] or x[1]) and x[1] <= date for x in skipped):
+                stale.append(app)
     db.executemany("DELETE FROM a WHERE app=?", [(a,) for a in stale])
     db.commit()
     C.log("Dropped %d applications whose kept rejection was not their first action" % len(stale))
@@ -243,13 +277,17 @@ def candidate_rows(app, pub, kind, doc, db):
 
 
 def run_appxml(store, st, cfg, tmp):
+    STATE_SKIPPED[0] = st.get("oact_skipped")
     db, apps, pubs = label_db(store, tmp)
     C.log("Need claims for %d applications, paragraphs for %d cited publications" % (len(apps), len(pubs)))
     have = set()
     for p in store.get_prefix("work/index/", os.path.join(tmp, "dl")):
         with gzip.open(p, "rt") as f:
             for line in f:
-                have.add(json.loads(line)[0])
+                try:
+                    have.add(json.loads(line)[0])
+                except Exception:
+                    continue
         os.remove(p)
     pid = C.find_appxml_product(cfg)
     files = C.product_files(pid, cfg)
@@ -260,43 +298,64 @@ def run_appxml(store, st, cfg, tmp):
         if time_left() < max(900, 3 * avg):
             break
         t0 = time.time()
-        z = os.path.join(tmp, f["fileName"])
-        C.download(f["fileDownloadURI"], z, cfg)
-        base = f["fileName"] + ".jsonl.gz"
-        paths = {s: os.path.join(tmp, s + "_" + base) for s in ("candidates", "index", "corpus")}
-        n = {"docs": 0, "examined_apps": 0, "claim_rows": 0, "corpus_docs": 0, "no_paragraphs": 0,
-             "claim_count_mismatch": 0}
-        with gzip.open(paths["candidates"], "wt") as fc, gzip.open(paths["index"], "wt") as fi, \
-                gzip.open(paths["corpus"], "wt") as fp:
-            for doc in C.split_docs(z):
-                n["docs"] += 1
-                pub, kind, app = C.doc_ids(doc[:6000])
-                if app in apps:
-                    rows, why = candidate_rows(app, pub, kind, doc, db)
-                    n["examined_apps"] += 1
-                    if why != "ok":
-                        n[why] += 1
-                    for r in rows:
-                        fc.write(json.dumps(r) + "\n")
-                    n["claim_rows"] += len(rows)
-                if pub in pubs and pub not in have:
-                    paras = C.paragraphs(doc)
-                    if paras:
-                        fp.write(json.dumps({"pub": pub, "kind": kind,
-                                             "paragraphs": {str(k): v for k, v in sorted(paras.items())}}) + "\n")
-                        fi.write(json.dumps([pub, C.ranges(paras)]) + "\n")
+        try:
+            z = os.path.join(tmp, f["fileName"])
+            C.download(f["fileDownloadURI"], z, cfg)
+            base = f["fileName"] + ".jsonl.gz"
+            paths = {s: os.path.join(tmp, s + "_" + base) for s in ("candidates", "index", "corpus")}
+            n = {"docs": 0, "examined_apps": 0, "claim_rows": 0, "corpus_docs": 0, "no_paragraphs": 0,
+                 "claim_count_mismatch": 0}
+            with gzip.open(paths["candidates"], "wt") as fc, gzip.open(paths["index"], "wt") as fi, \
+                    gzip.open(paths["corpus"], "wt") as fp:
+                for doc in C.split_docs(z):
+                    n["docs"] += 1
+                    try:  # anything unreadable in one publication: drop that publication, keep going
+                        pub, kind, app = C.doc_ids(doc[:6000])
+                        rows, why, corpus_line = [], None, None
+                        if app in apps:
+                            rows, why = candidate_rows(app, pub, kind, doc, db)
+                        if pub in pubs and pub not in have:
+                            paras = C.paragraphs(doc)
+                            if paras:
+                                corpus_line = (json.dumps({"pub": pub, "kind": kind, "paragraphs":
+                                                           {str(k): v for k, v in sorted(paras.items())}}),
+                                               json.dumps([pub, C.ranges(paras)]))
+                            else:
+                                n["no_paragraphs"] += 1
+                    except Exception:
+                        n["unreadable"] = n.get("unreadable", 0) + 1
+                        continue
+                    if app in apps:
+                        n["examined_apps"] += 1
+                        if why != "ok":
+                            n[why] += 1
+                        for r in rows:
+                            fc.write(json.dumps(r) + "\n")
+                        n["claim_rows"] += len(rows)
+                    if corpus_line:
+                        fp.write(corpus_line[0] + "\n")
+                        fi.write(corpus_line[1] + "\n")
                         have.add(pub)
                         n["corpus_docs"] += 1
-                    else:
-                        n["no_paragraphs"] += 1
-        os.remove(z)
-        # corpus and index for one archive file always go up in the same commit
-        pending["work/candidates/" + base] = paths["candidates"]
-        pending["work/index/" + base] = paths["index"]
-        pending["corpus/" + base] = paths["corpus"]
-        st["appxml_done"].append(f["fileName"])
-        avg = 0.7 * avg + 0.3 * (time.time() - t0)
-        C.log("[PUB] %s %s (%.0fs)" % (f["fileName"], json.dumps(n), time.time() - t0))
+            os.remove(z)
+            # corpus and index for one archive file always go up in the same commit
+            pending["work/candidates/" + base] = paths["candidates"]
+            pending["work/index/" + base] = paths["index"]
+            pending["corpus/" + base] = paths["corpus"]
+            st["appxml_done"].append(f["fileName"])
+            avg = 0.7 * avg + 0.3 * (time.time() - t0)
+            C.log("[PUB] %s %s (%.0fs)" % (f["fileName"], json.dumps(n), time.time() - t0))
+        except Exception as e:  # the whole weekly file is unreadable: skip it for good, never retry in a loop
+            C.log("[PUB] SKIPPED %s: %s" % (f["fileName"], str(e)[:300]))
+            base = f["fileName"] + ".jsonl.gz"
+            for x in [os.path.join(tmp, f["fileName"])] + [os.path.join(tmp, k + "_" + base) for k in ("candidates", "index", "corpus")]:
+                if os.path.exists(x):
+                    os.remove(x)
+            for k in ("work/candidates/", "work/index/", "corpus/"):
+                pending.pop(k + base, None)
+            st["appxml_done"].append(f["fileName"])
+            st.setdefault("appxml_skipped", []).append(f["fileName"])
+            continue
         if len(pending) >= 3 * COMMIT_EVERY:
             pending["state/state.json"] = state_file(st, tmp)
             store.put(pending, "publications through %s" % f["fileName"])
@@ -337,7 +396,10 @@ def check_quotes(store, cand, tmp):
     for p in cand:
         with gzip.open(p, "rt") as f:
             for line in f:
-                r = json.loads(line)
+                try:
+                    r = json.loads(line); r["application"]
+                except Exception:
+                    continue
                 for key, q in r.get("quotes", {}).items():
                     pub, n = key.split("|")
                     need.setdefault(pub, {}).setdefault(n, []).append((r["application"], q))
@@ -346,7 +408,10 @@ def check_quotes(store, cand, tmp):
         local = store.get(path, os.path.join(tmp, "corp"))
         with gzip.open(local, "rt") as f:
             for line in f:
-                d = json.loads(line)
+                try:
+                    d = json.loads(line); d["pub"], d["paragraphs"]
+                except Exception:
+                    continue
                 if d["pub"] not in need:
                     continue
                 for n, items in need[d["pub"]].items():
@@ -368,7 +433,10 @@ def run_final(store, st, tmp):
     for p in store.get_prefix("work/index/", os.path.join(tmp, "dl")):
         with gzip.open(p, "rt") as f:
             for line in f:
-                pub, spec = json.loads(line)
+                try:
+                    pub, spec = json.loads(line)
+                except Exception:
+                    continue
                 index.setdefault(pub, spec)
         os.remove(p)
     cand = store.get_prefix("work/candidates/", os.path.join(tmp, "cand"))
@@ -376,7 +444,11 @@ def run_final(store, st, tmp):
     for p in cand:  # pass 1: families, and which publication of each application to use (A1 first)
         with gzip.open(p, "rt") as f:
             for line in f:
-                r = json.loads(line)
+                try:
+                    r = json.loads(line)
+                    r["application"], r["kind"], r["publication"], r["related"]
+                except Exception:
+                    continue
                 for x in r["related"]:
                     fam.union(r["application"], x)
                 b = best.get(r["application"])
@@ -386,8 +458,8 @@ def run_final(store, st, tmp):
     stats = {"applications": len(best), "rows": 0, "answers": 0, "rows_with_quote_verified_answer": 0,
              "quoted_citations_checked": sum(bad.values()) + sum(good.values()),
              "quoted_citations_matching": sum(good.values()),
-             "applications_dropped_quote_mismatch": len(bad), "scrapped_no_answer_in_corpus": 0,
-             "answers_dropped_not_in_corpus": 0, "corpus_publications": len(index)}
+             "applications_dropped_quote_mismatch": len(bad), "scrapped_cited_paragraph_missing": 0,
+             "unreadable_rows": 0, "corpus_publications": len(index)}
     writers, counts, shard_no, seen = {}, {"train": 0, "test": 0}, {"train": 0, "test": 0}, set()
     out_files = {}
 
@@ -405,30 +477,31 @@ def run_final(store, st, tmp):
     for p in cand:  # pass 2: check every answer against the corpus, write the final rows
         with gzip.open(p, "rt") as f:
             for line in f:
-                r = json.loads(line)
-                if best[r["application"]] != r["kind"] + "|" + r["publication"] or r["id"] in seen:
-                    continue
-                seen.add(r["id"])
-                if r["application"] in bad:
-                    continue  # a quoted citation in this action did not match its paragraph: distrust the whole action
-                ok = [[q, n] for q, n in r["answers"] if q in index and C.in_ranges(index[q], n)]
-                stats["answers_dropped_not_in_corpus"] += len(r["answers"]) - len(ok)
-                if not ok:
-                    stats["scrapped_no_answer_in_corpus"] += 1
-                    continue
-                r["answers"] = ok
-                r["quote_verified"] = [[q, n] for q, n in ok if (r["application"], "%s|%d" % (q, n)) in verified]
-                family = fam.find(r["application"])
-                split = "test" if int(hashlib.sha1(family.encode()).hexdigest(), 16) % 20 == 0 else "train"
-                row = {k: r[k] for k in ("id", "application", "publication", "claim_number", "claim_text",
-                                         "claim_text_with_parents", "independent", "answers", "quote_verified",
-                                         "office_action_date", "art_unit")}
-                row["family"] = family
-                writer(split).write(json.dumps(row) + "\n")
-                counts[split] += 1
-                stats["rows"] += 1
-                stats["rows_with_quote_verified_answer"] += bool(row["quote_verified"])
-                stats["answers"] += len(row["answers"])
+                try:  # any unreadable row is dropped
+                    r = json.loads(line)
+                    if best[r["application"]] != r["kind"] + "|" + r["publication"] or r["id"] in seen:
+                        continue
+                    seen.add(r["id"])
+                    if r["application"] in bad:
+                        continue  # a quoted citation in this action did not match its paragraph: distrust the whole action
+                    ok = [[q, n] for q, n in r["answers"] if q in index and C.in_ranges(index[q], n)]
+                    if len(ok) != len(r["answers"]):  # any cited paragraph missing or unreadable: drop the whole claim
+                        stats["scrapped_cited_paragraph_missing"] += 1
+                        continue
+                    r["quote_verified"] = [[q, n] for q, n in ok if (r["application"], "%s|%d" % (q, n)) in verified]
+                    family = fam.find(r["application"])
+                    split = "test" if int(hashlib.sha1(family.encode()).hexdigest(), 16) % 20 == 0 else "train"
+                    row = {k: r[k] for k in ("id", "application", "publication", "claim_number", "claim_text",
+                                             "claim_text_with_parents", "independent", "answers", "quote_verified",
+                                             "office_action_date", "art_unit")}
+                    row["family"] = family
+                    writer(split).write(json.dumps(row) + "\n")
+                    counts[split] += 1
+                    stats["rows"] += 1
+                    stats["rows_with_quote_verified_answer"] += bool(row["quote_verified"])
+                    stats["answers"] += len(row["answers"])
+                except Exception:
+                    stats["unreadable_rows"] += 1
         os.remove(p)
     for w in writers.values():
         w.close()
