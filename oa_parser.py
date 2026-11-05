@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 3  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 4  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 
@@ -303,7 +303,7 @@ def unknown_name_before(seg, pos, by_name):
 
 
 REJ_STMT = re.compile(
-    r"claims?\s+(\d+(?:\s*(?:-|–|to|through|,(?:\s*and)?|and|&)\s*\d+)*)\s*(?:is|are|is/are|stand|stands)\s+"
+    r"claims?(?:\s*\(s\))?\s+(\d+(?:\s*(?:-|–|to|through|,(?:\s*and)?|and|&)\s*\d+)*)\s*(?:is|are|is/are|stand|stands)\s+"
     r"(?:also\s+|further\s+|hereby\s+|now\s+)?rejected\s+under\s+(?:pre-?\s*AIA\s+)?35\s*U\.?\s*S\.?\s*C\.?\s*§?\s*(\d{3})", re.I)
 QUOTE = re.compile(r"[\"“]([^\"“”]{25,600})[\"”]")
 
@@ -330,6 +330,9 @@ def parse_office_action(text, strict=True):
     return parse_office_action_full(text, strict)[0]
 
 
+UNSTATED = [0]  # claims dropped by the last parse because no 102/103 statement named them (for test reporting)
+
+
 def parse_office_action_full(text, strict=True):
     """Return (labels, quotes): labels {claim_number: {(reference, paragraph), ...}} for 102/103 paragraph
     citations, kept only for claims named in a 102/103 rejection statement; quotes {(reference, paragraph): text}
@@ -347,6 +350,7 @@ def parse_office_action_full(text, strict=True):
     labels = OrderedDict()
     quotes = {}
     stated = rejected_claims(text)
+    UNSTATED[0] = 0
     for i, h in enumerate(heads):
         k = bisect.bisect_left(ev_pos, h.start())
         if k == 0 or events[k - 1][1] not in ("102", "103"):
@@ -393,6 +397,8 @@ def parse_office_action_full(text, strict=True):
         for c, pairs in per_claim.items():
             if pairs and c in stated:  # only claims the action formally rejects under 102/103
                 labels.setdefault(c, set()).update(pairs)
+            elif pairs:
+                UNSTATED[0] += 1
     used = {p for v in labels.values() for p in v}
     return labels, {k: v for k, v in quotes.items() if k in used}
 

@@ -38,6 +38,7 @@ jobs:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PM_TEST_PUB: ${{ github.event.inputs.pub_files }}
+          PM_TEST_DUMP: "1"
         run: |
           python -c "import cloud; s=cloud.HFStore(); print('Hugging Face dataset OK:', s.repo)"
           python -c "import os,collector as C; os.makedirs(C.WORK,exist_ok=True); C.cmd_test(C.curl_config(os.environ['USPTO_API_KEY']))"

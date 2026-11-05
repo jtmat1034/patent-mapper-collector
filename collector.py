@@ -279,7 +279,7 @@ def oa_row(rec):
         return None, "bad_app_number"
     labels, quotes = P.parse_office_action_full(text)
     if not labels:
-        return None, "nothing_extracted"
+        return None, "no_rejection_statement" if P.UNSTATED[0] else "nothing_extracted"
     m = PENDING.search(text)
     pending_max = max(int(x) for x in re.findall(r"\d+", m.group(1))) if m else None
     return {
@@ -735,9 +735,16 @@ def cmd_test(cfg):
         g = pf[i]
         z = os.path.join(WORK, "test_" + g["fileName"])
         download(g["fileDownloadURI"], z, cfg)
+        with zipfile.ZipFile(z) as zz:
+            names = zz.namelist()
+        log("  [%s] %d members: %s" % (g["fileName"], len(names), names[:6]))
         n = ok = shown = n_claims = deps = broken = 0
         for doc in split_docs(z):
             n += 1
+            if n <= 2 and os.environ.get("PM_TEST_DUMP"):
+                d = re.search(r"<(?:subdoc-)?description", doc)
+                log("  RAW doc %d head: %r" % (n, doc[:700]))
+                log("  RAW doc %d description: %r" % (n, doc[d.start():d.start() + 1800] if d else "(no description tag)"))
             pub, kind, app = doc_ids(doc[:6000])
             paras, cl = paragraphs(doc), claims(doc)
             if pub and app and paras and cl:
