@@ -1,0 +1,5 @@
+__pycache__/
+work/
+dataset/
+apikey.txt
+collector.log
