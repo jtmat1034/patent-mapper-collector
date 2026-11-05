@@ -821,6 +821,8 @@ def main():
         return cmd_test(cfg)
     if cmd == "build":
         return build()
+    if cmd == "spotcheck":
+        return cmd_spotcheck(cfg, int(os.environ.get("PM_SPOT_N", "3")))
     if cmd == "run":
         st = load_state()
         stage_oact(cfg, st)
@@ -833,3 +835,106 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- spot check: build complete rows for a few random real rejections ---------------------------
+
+def find_pub_strings(o, out):
+    """Collect (key, value) pairs that look like publication numbers or publication dates."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if isinstance(v, (dict, list)):
+                find_pub_strings(v, out)
+            elif "ublication" in k and isinstance(v, (str, int)):
+                out.append((k, str(v)))
+    elif isinstance(o, list):
+        for x in o:
+            find_pub_strings(x, out)
+    return out
+
+
+def app_pub_info(app, cfg):
+    """(publication number, publication date) of an application, from the Open Data Portal."""
+    d = get_json("%s/api/v1/patent/applications/%s" % (API, app), cfg) or {}
+    kv = find_pub_strings(d, [])
+    nums = [digits(v) for k, v in kv if "umber" in k and len(digits(v)) == 11]
+    dates = [v[:10] for k, v in kv if "ate" in k and re.match(r"\d{4}-\d\d-\d\d", v)]
+    return (nums[0] if nums else None), (min(dates) if dates else None), kv
+
+
+def pub_to_app(pub, cfg):
+    """Application number of a publication, via the Open Data Portal search."""
+    for q in ("applicationMetaData.earliestPublicationNumber:US%sA1" % pub, "US%sA1" % pub, pub):
+        d = get_json("%s/api/v1/patent/applications/search?q=%s&limit=3" % (API, q.replace(":", "%3A")), cfg) or {}
+        bag = d.get("patentFileWrapperDataBag") or d.get("results") or []
+        for r in bag:
+            a = digits(r.get("applicationNumberText") or (r.get("applicationMetaData") or {}).get("applicationNumberText"))
+            if a:
+                return a, q
+    return None, None
+
+
+def pub_doc(pub, date, files, cfg, cache):
+    """The XML document of one publication, from the weekly full-text file for its publication date."""
+    tag = date.replace("-", "")[2:]
+    f = next((x for x in files if tag in x["fileName"]), None)
+    if not f:
+        return None, "no weekly file for %s" % date
+    z = os.path.join(WORK, f["fileName"])
+    if f["fileName"] not in cache:
+        download(f["fileDownloadURI"], z, cfg)
+        cache[f["fileName"]] = z
+    for doc in split_docs(cache[f["fileName"]]):
+        p, _, _ = doc_ids(doc[:6000])
+        if p == pub:
+            return doc, f["fileName"]
+    return None, "not in %s" % f["fileName"]
+
+
+def cmd_spotcheck(cfg, n_actions=3, seed=None):
+    import random
+    rnd = random.Random(seed)
+    files = product_files("OACT", cfg)
+    f = files[-1]
+    z = os.path.join(WORK, "spot_" + f["fileName"])
+    download(f["fileDownloadURI"], z, cfg)
+    kept = []
+    for obj in json_members(z):
+        for rec in oa_records(obj):
+            row, why = oa_row(rec)
+            if row:
+                kept.append((row, rec.get("oaText") or rec.get("bodyText")))
+    os.remove(z)
+    log("SPOT CHECK: %d kept rejections in %s; picking %d at random" % (len(kept), f["fileName"], n_actions))
+    pf = product_files(find_appxml_product(cfg), cfg)
+    cache = {}
+    for row, text in rnd.sample(kept, min(n_actions, len(kept))):
+        app = row["app"]
+        log("=" * 100)
+        log("APPLICATION %s  office action %s  art unit %s" % (app, row["date"], row["art_unit"]))
+        pub, pdate, kv = app_pub_info(app, cfg)
+        log("  own publication: %s (%s)" % (pub, pdate))
+        if not pub or not pdate:
+            log("  publication fields seen:", kv[:12])
+            continue
+        doc, where = pub_doc(pub, pdate, pf, cfg, cache)
+        if not doc:
+            log("  could not load own publication:", where)
+            continue
+        cl = claims(doc)
+        k = rnd.choice(sorted(row["labels"], key=int))
+        text_wp, indep, complete = with_parents(cl, int(k))
+        log("  CLAIM %s (independent=%s, chain complete=%s) as the model would see it:\n%s" % (k, indep, complete, text_wp[:1500]))
+        i = text.find("laim %s" % k)
+        log("  OFFICE ACTION around claim %s:\n%s" % (k, re.sub(r"\s+", " ", text[max(0, i - 200):i + 1500]) if i >= 0 else "(not found)"))
+        for ref, para in row["labels"][k][:3]:
+            capp, how = pub_to_app(ref, cfg)
+            rdate = app_pub_info(capp, cfg)[1] if capp else None
+            rdoc, rwhere = pub_doc(ref, rdate, pf, cfg, cache) if rdate else (None, "no date (search %s)" % how)
+            paras = paragraphs(rdoc) if rdoc else {}
+            log("  ANSWER %s para %d -> %s" % (ref, para, (paras.get(para) or "(missing: %s)" % rwhere)[:700]))
+            q = row.get("quotes", {}).get("%s|%d" % (ref, para))
+            if q:
+                log("    examiner quote: %s" % q[:300])
+    for p in cache.values():
+        os.remove(p)

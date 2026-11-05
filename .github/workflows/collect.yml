@@ -8,14 +8,14 @@ on:
         description: "test = check the API key and real file formats; run = build"
         default: run
         type: choice
-        options: [run, test]
+        options: [run, test, spotcheck]
       pub_files:
         description: "test mode: which publication files to check (0 = oldest, -1 = newest)"
         default: "-1"
   schedule:
     - cron: "41 */6 * * *"   # safety net: restarts the chain if a run ever fails to hand off
 concurrency:
-  group: ${{ github.event.inputs.mode == 'test' && 'collect-test' || 'collect' }}
+  group: ${{ (github.event.inputs.mode == 'test' || github.event.inputs.mode == 'spotcheck') && format('collect-{0}', github.event.inputs.mode) || 'collect' }}
   cancel-in-progress: false
 permissions:
   contents: read
@@ -42,9 +42,15 @@ jobs:
         run: |
           python -c "import cloud; s=cloud.HFStore(); print('Hugging Face dataset OK:', s.repo)"
           python -c "import os,collector as C; os.makedirs(C.WORK,exist_ok=True); C.cmd_test(C.curl_config(os.environ['USPTO_API_KEY']))"
+      - name: Spot check
+        if: ${{ github.event.inputs.mode == 'spotcheck' }}
+        env:
+          USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
+          PM_SPOT_N: "4"
+        run: python -c "import os,collector as C; os.makedirs(C.WORK,exist_ok=True); C.cmd_spotcheck(C.curl_config(os.environ['USPTO_API_KEY']), int(os.environ['PM_SPOT_N']))"
       - name: Build
         id: build
-        if: ${{ github.event.inputs.mode != 'test' }}
+        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' }}
         env:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
