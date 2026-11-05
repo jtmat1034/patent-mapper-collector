@@ -905,7 +905,7 @@ def cmd_spotcheck(cfg, n_actions=3, seed=None):
             if row:
                 kept.append((row, rec.get("oaText") or rec.get("bodyText")))
     os.remove(z)
-    only = [a.strip() for a in os.environ.get("PM_SPOT_APPS", "").split(",") if a.strip()]
+    only = [a.strip() for a in os.environ.get("PM_SPOT_APPS", "").split(",") if len(a.strip()) == 8 and a.strip().isdigit()]
     if only:
         for row, text in kept:
             if row["app"] in only:
