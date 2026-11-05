@@ -609,7 +609,7 @@ def build():
 
 def shape(o, depth=0):
     """Compact description of a JSON value's structure."""
-    if depth > 3:
+    if depth > 6:
         return "..."
     if isinstance(o, dict):
         return "{" + ", ".join("%s: %s" % (k, shape(v, depth + 1)) for k, v in list(o.items())[:25]) + "}"
