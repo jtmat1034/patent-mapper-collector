@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 5  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 6  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 
@@ -23,6 +23,11 @@ NAME_THEN_PUB = re.compile(
 # Granted US patents (6,243,581 / US 6243581 B1 / U.S. Pat. No. 10,123,456): cited by column/line, never by
 # paragraph, so they are tracked only to keep their citations from being credited to a publication.
 GRANTED = re.compile(r"(?<![\d,/.])(?:\d{1,2},\d{3},\d{3}|(?<=US)\s?\d{7,8}(?=\s*B\d)|(?<=US )\d{7,8}(?=\s*B\d))(?![\d,])")
+# the reference list of a rejection statement, split into one chunk per reference
+STATEMENT_REFS = re.compile(r"(?:unpatentable\s+over|obvious\s+over|anticipated\s+by|anticipated\s+over)\s+(.{0,700}?)"
+                            r"(?=\.\s+[A-Z]|\n|$)", re.I | re.S)
+REF_SPLIT = re.compile(r"\b(?:further\s+)?in\s+view\s+of\b|\band\s+(?:further\s+)?(?:in\s+view\s+of\s+)?(?=[A-Z])|;|"
+                       r"\bas\s+evidenced\s+by\b", re.I)
 # 'Yanagawa '451' style shorthand
 SHORT = re.compile(r"([A-Z][A-Za-z'\-]+)\s*[‘’'`]\s*(\d{3})\b")
 
@@ -127,6 +132,16 @@ def reference_index(text):
         name = surname_before(text, m.start())
         if name:
             by_name.setdefault(name.lower(), "GRANT")
+    # every reference named in a rejection statement ("over Chen (WO ...) in view of Lee (US 2019/...)"):
+    # a named reference that is not a US publication becomes OTHER, so its citations are never credited to one
+    for m in STATEMENT_REFS.finditer(text):
+        for chunk in REF_SPLIT.split(m.group(1)):
+            names = [w.group(0) for w in CAP.finditer(chunk) if w.group(0).lower() not in STOP_WORDS]
+            if not names:
+                continue
+            pubs = [norm_pub(x.group(1) + x.group(2)) for x in PUB.finditer(chunk) if not is_foreign(chunk, x.start())]
+            pubs = [x for x in pubs if x]
+            by_name.setdefault(names[0].lower(), pubs[0] if len(pubs) == 1 else "OTHER")
     return by_name, by_suffix
 
 
@@ -368,14 +383,14 @@ def parse_office_action_full(text, strict=True):
         if not refs:
             prior_start = events[k - 1][0]
             pa = bisect.bisect_left(ref_pos, prior_start)
-            prev = [r for r in all_refs[pa:a] if r[1] not in ("AAPA", "GRANT")]
+            prev = [r for r in all_refs[pa:a] if r[1] not in ("AAPA", "GRANT", "OTHER")]
             refs = [(-1, prev[-1][1])] if prev else []
         if not refs:
             continue
         per_claim = {}
         for pos, nums, run_end in paragraph_cites(seg, STRICT_MAX_SPAN if strict else None):
             pub = attribute(seg, pos, refs, ends, strict)
-            if pub is None or pub in ("AAPA", "GRANT"):
+            if pub is None or pub in ("AAPA", "GRANT", "OTHER"):
                 continue
             if self_citation(seg, pos, run_end):
                 continue  # 'paragraph 6 of this office action', 'paragraph 13 of the instant disclosure'
