@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 4  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 5  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 

@@ -188,6 +188,28 @@ AMEND = re.compile(r"amendment|amended|response filed|remarks filed|request for 
 PENDING = re.compile(r"[Cc]laims?(?:\(s\))?\s+(\d+(?:\s*(?:-|–|to|through|,|and|&)\s*\d+)*)\s*"
                      r"(?:is|are|is/are)\s+(?:currently\s+|now\s+|presently\s+)?pending")
 OA_CODES = {"CTNF"}  # first-action non-final rejections (see module docstring)
+# signs that an action answers something the applicant filed, so the examined claims may differ from the published ones
+RESPONSE = re.compile(r"response\s+to\s+arguments|applicant'?s?[’']?s?\s+arguments?|arguments?\s+(?:filed|presented|submitted)|"
+                      r"in\s+response\s+to\s+(?:the\s+)?(?:communication|reply|remarks|response|papers?|filing|amendment)|"
+                      r"has\s+been\s+entered|cancell?ed\s+claims?|claims?\s+[\d,\-– and]+\s+(?:is|are|have\s+been|has\s+been)\s+cancell?ed",
+                      re.I)
+ARCHIVE_START = "2007-07-29"  # first week of the office-action archive
+
+
+def oa_event(rec):
+    """(app, date, code, filing date) for any examiner action, used to find each application's first action."""
+    sec = rec.get("sections") if isinstance(rec.get("sections"), dict) else {}
+    code = first(rec.get("documentCode") or rec.get("legacyDocumentCodeIdentifier")
+                 or sec.get("legacyDocumentCodeIdentifier")) or ""
+    app = digits(first(rec.get("patentApplicationNumber") or rec.get("applicationNumberText")))
+    date = (first(rec.get("submissionDate") or sec.get("submissionDate")) or "")[:10]
+    filed = (first(rec.get("filingDate") or sec.get("filingDate")) or "")[:10]
+    return app, date, code, filed
+
+
+def substantive(code):
+    """Actions that mean prosecution already happened: every examiner action except a restriction requirement."""
+    return code != "CTRS" and (code.startswith("CT") or code in ("NOA", "N417", "EXQ"))
 
 
 def oa_records(obj):
@@ -272,7 +294,7 @@ def oa_row(rec):
         text = "\n".join(t for t in text if isinstance(t, str))
     if not text or len(text) < 500:
         return None, "no_text"
-    if AMEND.search(text):
+    if AMEND.search(text) or RESPONSE.search(text):
         return None, "responds_to_amendment"
     app = digits(first(rec.get("patentApplicationNumber") or rec.get("applicationNumberText")))
     if len(app) != 8:
@@ -281,12 +303,21 @@ def oa_row(rec):
     if not labels:
         return None, "no_rejection_statement" if P.UNSTATED[0] else "nothing_extracted"
     m = PENDING.search(text)
-    pending_max = max(int(x) for x in re.findall(r"\d+", m.group(1))) if m else None
+    pending_max = None
+    if m:
+        pend = P.claim_numbers(m.group(1))
+        if sorted(set(pend)) != list(range(1, max(pend) + 1)):
+            return None, "pending_claims_have_gaps"  # claims were cancelled before this action
+        pending_max = max(pend)
+    filed = oa_event(rec)[3]
+    if not filed or filed < ARCHIVE_START:
+        return None, "filed_before_archive"  # an earlier action could exist outside the archive
     return {
         "app": app,
         "date": (first(rec.get("submissionDate") or sec.get("submissionDate")) or "")[:10],
         "art_unit": str(first(rec.get("groupArtUnitNumber") or sec.get("groupArtUnitNumber")) or ""),
         "pending_max": pending_max,
+        "filed": filed,
         "labels": {str(k): sorted([p, n] for p, n in v) for k, v in labels.items()},
         "quotes": {"%s|%d" % k: v for k, v in quotes.items()},
     }, "kept"

@@ -142,10 +142,14 @@ def run_oact(store, st, cfg, tmp):
         C.download(f["fileDownloadURI"], z, cfg)
         out = os.path.join(tmp, "labels_" + f["fileName"] + ".jsonl.gz")
         samp = os.path.join(tmp, "samples_" + f["fileName"] + ".jsonl.gz")
+        evp = os.path.join(tmp, "events_" + f["fileName"] + ".jsonl.gz")
         counts, n_s = {}, 0
-        with gzip.open(out, "wt") as g, gzip.open(samp, "wt") as gs:
+        with gzip.open(out, "wt") as g, gzip.open(samp, "wt") as gs, gzip.open(evp, "wt") as ge:
             for obj in C.json_members(z):
                 for rec in C.oa_records(obj):
+                    app, date, code, _ = C.oa_event(rec)
+                    if app and date and C.substantive(code):
+                        ge.write(json.dumps([app, date, code]) + "\n")
                     row, why = C.oa_row(rec)
                     counts[why] = counts.get(why, 0) + 1
                     if row:
@@ -158,6 +162,7 @@ def run_oact(store, st, cfg, tmp):
         os.remove(z)
         pending["work/labels/%s.jsonl.gz" % f["fileName"]] = out
         pending["work/samples/%s.jsonl.gz" % f["fileName"]] = samp
+        pending["work/events/%s.jsonl.gz" % f["fileName"]] = evp
         st["oact_done"].append(f["fileName"])
         avg = 0.7 * avg + 0.3 * (time.time() - t0)
         C.log("[OA] %s %s (%.0fs)" % (f["fileName"], json.dumps(counts), time.time() - t0))
@@ -181,7 +186,6 @@ def label_db(store, tmp):
     paths = store.get_prefix("work/labels/", os.path.join(tmp, "dl"))
     db = sqlite3.connect(os.path.join(tmp, "labels.sqlite"))
     db.execute("CREATE TABLE IF NOT EXISTS a (app TEXT PRIMARY KEY, date TEXT, row TEXT)")
-    pubs = set()
     for p in paths:
         with gzip.open(p, "rt") as f:
             for line in f:
@@ -189,12 +193,27 @@ def label_db(store, tmp):
                 old = db.execute("SELECT date FROM a WHERE app=?", (r["app"],)).fetchone()
                 if old is None or r["date"] < old[0]:
                     db.execute("INSERT OR REPLACE INTO a VALUES (?,?,?)", (r["app"], r["date"], line))
-                for v in r["labels"].values():
-                    for q, _ in v:
-                        pubs.add(q)
         os.remove(p)
     db.commit()
+    # drop any application whose earliest substantive action anywhere in the archive is not the kept rejection
+    first = {}
+    for p in store.get_prefix("work/events/", os.path.join(tmp, "dl")):
+        with gzip.open(p, "rt") as f:
+            for line in f:
+                app, date, _ = json.loads(line)
+                if app not in first or date < first[app]:
+                    first[app] = date
+        os.remove(p)
+    stale = [app for app, date in db.execute("SELECT app, date FROM a") if first.get(app, date) < date]
+    db.executemany("DELETE FROM a WHERE app=?", [(a,) for a in stale])
+    db.commit()
+    C.log("Dropped %d applications whose kept rejection was not their first action" % len(stale))
     apps = {r[0] for r in db.execute("SELECT app FROM a")}
+    pubs = set()
+    for (row,) in db.execute("SELECT row FROM a"):
+        for v in json.loads(row)["labels"].values():
+            for q, _ in v:
+                pubs.add(q)
     return db, apps, pubs
 
 
