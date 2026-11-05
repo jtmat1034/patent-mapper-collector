@@ -151,6 +151,17 @@ NEGATIVE = re.compile(r"\b(?:does|do|did)\s+not\s+(?:\w+\s+){0,2}(?:teach|disclo
                       r"\bfails?\s+to\s+(?:\w+\s+){0,2}(?:teach|disclose|show|describe)|\bsilent\b|\black(?:s|ing)?\b", re.I)
 
 
+def name_lookup(by_name, name):
+    """by_name entry for a matched name; case-insensitive matching can differ from .lower() (e.g. Arıkan / ARIKAN)."""
+    for k in (name.lower(), name.casefold()):
+        if k in by_name:
+            return by_name[k]
+    for k, v in by_name.items():
+        if re.fullmatch(re.escape(k), name, re.I):
+            return v
+    return None
+
+
 def mentions(segment, by_name, by_suffix, ends=None):
     """Positions in segment where a reference is named, -> (pos, pub). Fills ends[pos] = end.
     Applicant-admitted prior art / Official Notice appear as the pseudo-reference 'AAPA'."""
@@ -171,7 +182,9 @@ def mentions(segment, by_name, by_suffix, ends=None):
     if by_name:
         pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True)) + r")\b", re.I)
         for m in pat.finditer(segment):
-            found.append((m.start(), by_name[m.group(1).lower()])); ends.setdefault(m.start(), m.end())
+            pub = name_lookup(by_name, m.group(1))
+            if pub:
+                found.append((m.start(), pub)); ends.setdefault(m.start(), m.end())
     return sorted(set(found))
 
 
