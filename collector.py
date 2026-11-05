@@ -7,8 +7,7 @@
 
 Pipeline (all public USPTO Open Data Portal bulk files, linked by application number):
   1. Office Actions Weekly Archives (OACT, 2020+): first-action non-final rejections are parsed
-     with oa_parser.py into claim -> {(publication, paragraph)} labels, plus allowed / allowable
-     claims ("no reference"). Office actions that respond to an amendment are skipped, because
+     with oa_parser.py into claim -> {(publication, paragraph)} labels. Rejected claims only. Office actions that respond to an amendment are skipped, because
      the claim text examined would no longer match the published claims.
   2. Patent Application Full-Text XML (every pre-grant publication since 2001): claims of the
      examined applications, and every paragraph of every cited publication.
@@ -278,9 +277,8 @@ def oa_row(rec):
     app = digits(first(rec.get("patentApplicationNumber") or rec.get("applicationNumberText")))
     if len(app) != 8:
         return None, "bad_app_number"
-    labels = P.parse_office_action(text)
-    allow = {k: v for k, v in P.allowable_claims(text).items() if k not in labels}
-    if not labels and not allow:
+    labels, quotes = P.parse_office_action_full(text)
+    if not labels:
         return None, "nothing_extracted"
     m = PENDING.search(text)
     pending_max = max(int(x) for x in re.findall(r"\d+", m.group(1))) if m else None
@@ -290,7 +288,7 @@ def oa_row(rec):
         "art_unit": str(first(rec.get("groupArtUnitNumber") or sec.get("groupArtUnitNumber")) or ""),
         "pending_max": pending_max,
         "labels": {str(k): sorted([p, n] for p, n in v) for k, v in labels.items()},
-        "no_reference": {str(k): v for k, v in allow.items()},
+        "quotes": {"%s|%d" % k: v for k, v in quotes.items()},
     }, "kept"
 
 
@@ -589,7 +587,7 @@ def build():
             continue
         family = fam.find(app)
         dest = te if int(hashlib.sha1(family.encode()).hexdigest(), 16) % 20 == 0 else tr  # 5% test
-        items = [(k, v, None) for k, v in a["labels"].items()] + [(k, [], v) for k, v in a["no_reference"].items()]
+        items = [(k, v, None) for k, v in a["labels"].items()]
         for k, answers, kind in items:
             if k not in cl:
                 stats["scrapped_claim_missing"] += 1

@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 2  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 3  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 
@@ -302,10 +302,40 @@ def unknown_name_before(seg, pos, by_name):
     return False
 
 
+REJ_STMT = re.compile(
+    r"claims?\s+(\d+(?:\s*(?:-|–|to|through|,(?:\s*and)?|and|&)\s*\d+)*)\s*(?:is|are|is/are|stand|stands)\s+"
+    r"(?:also\s+|further\s+|hereby\s+|now\s+)?rejected\s+under\s+(?:pre-?\s*AIA\s+)?35\s*U\.?\s*S\.?\s*C\.?\s*§?\s*(\d{3})", re.I)
+QUOTE = re.compile(r"[\"“]([^\"“”]{25,600})[\"”]")
+
+
+def rejected_claims(text):
+    """Claims named in a 'Claims ... are rejected under 35 U.S.C. 102/103' statement."""
+    out = set()
+    for m in REJ_STMT.finditer(text):
+        if m.group(2) in ("102", "103"):
+            out.update(claim_numbers(m.group(1)))
+    return out
+
+
+def quote_near(seg, pos, run_end):
+    """An examiner quotation in the same clause as a citation (the text the examiner says the paragraph contains)."""
+    a = max(seg.rfind(";", 0, pos), seg.rfind("\n", 0, pos), pos - 700, 0)
+    b = min([x for x in (seg.find(";", run_end), seg.find("\n", run_end)) if x > 0] + [run_end + 200, len(seg)])
+    qs = [m.group(1) for m in QUOTE.finditer(seg, a, b)]
+    return max(qs, key=len) if qs else None
+
+
 def parse_office_action(text, strict=True):
-    """Return {claim_number: {(reference, paragraph), ...}} for 102/103 paragraph citations."""
+    """{claim: {(reference, paragraph)}} for 102/103 paragraph citations (see parse_office_action_full)."""
+    return parse_office_action_full(text, strict)[0]
+
+
+def parse_office_action_full(text, strict=True):
+    """Return (labels, quotes): labels {claim_number: {(reference, paragraph), ...}} for 102/103 paragraph
+    citations, kept only for claims named in a 102/103 rejection statement; quotes {(reference, paragraph): text}
+    for citations the examiner quoted."""
     if not text:
-        return {}
+        return {}, {}
     import bisect
     by_name, by_suffix = reference_index(text)
     all_ends = {}
@@ -315,6 +345,8 @@ def parse_office_action(text, strict=True):
     ev_pos = [e[0] for e in events]
     heads = list(SECTION_HEAD.finditer(text))
     labels = OrderedDict()
+    quotes = {}
+    stated = rejected_claims(text)
     for i, h in enumerate(heads):
         k = bisect.bisect_left(ev_pos, h.start())
         if k == 0 or events[k - 1][1] not in ("102", "103"):
@@ -352,12 +384,17 @@ def parse_office_action(text, strict=True):
                     continue  # citation sits in a 'does not teach' sentence
             # in a section covering several claims, a citation tied to particular claims goes to those claims only
             targets = (clause_claims(seg, pos, claims) if len(claims) > 1 else set()) or claims
+            nums = [n for n in nums if 0 < n < 2000]
             for c in targets:
-                per_claim.setdefault(c, set()).update((pub, n) for n in nums if 0 < n < 2000)
+                per_claim.setdefault(c, set()).update((pub, n) for n in nums)
+            q = quote_near(seg, pos, run_end)
+            if q and len(nums) == 1:  # a quote beside a single paragraph can be checked against that paragraph
+                quotes.setdefault((pub, nums[0]), q)
         for c, pairs in per_claim.items():
-            if pairs:
+            if pairs and c in stated:  # only claims the action formally rejects under 102/103
                 labels.setdefault(c, set()).update(pairs)
-    return labels
+    used = {p for v in labels.values() for p in v}
+    return labels, {k: v for k, v in quotes.items() if k in used}
 
 
 # --- allowable claims (the "no reference" class) ---------------------------------------

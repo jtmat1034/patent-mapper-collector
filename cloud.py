@@ -22,6 +22,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -207,16 +208,16 @@ def candidate_rows(app, pub, kind, doc, db):
     rel = C.RELATED.search(doc)
     links = sorted({C.digits(x) for x in C.REL_DOC.findall(rel.group(0))} - {"", app}) if rel else []
     rows = []
-    items = [(k, v, None) for k, v in a["labels"].items()] + [(k, [], v) for k, v in a["no_reference"].items()]
-    for k, answers, lab in items:
+    quotes = a.get("quotes") or {}
+    for k, answers in a["labels"].items():
         if k not in cl:
             continue
         text, independent = C.with_parents(cl, int(k))
+        q = {"%s|%d" % (r, n): quotes["%s|%d" % (r, n)] for r, n in answers if "%s|%d" % (r, n) in quotes}
         rows.append({"id": "%s-%s" % (app, k), "application": app, "publication": pub, "kind": kind,
                      "claim_number": int(k), "claim_text": cl[k][0], "claim_text_with_parents": text,
-                     "independent": independent, "label": "rejected" if lab is None else lab,
-                     "answers": answers, "office_action_date": a["date"], "art_unit": a["art_unit"],
-                     "related": links})
+                     "independent": independent, "answers": answers, "quotes": q,
+                     "office_action_date": a["date"], "art_unit": a["art_unit"], "related": links})
     return rows, "ok"
 
 
@@ -291,6 +292,55 @@ def run_appxml(store, st, cfg, tmp):
 
 # --- stage 3 ------------------------------------------------------------------------------------
 
+WORD = re.compile(r"[a-z0-9]+")
+
+
+def norm(t):
+    return " " + " ".join(WORD.findall(t.lower())) + " "
+
+
+def quote_matches(quote, para):
+    """None if the quote cannot be checked; else whether every substantial fragment of it is in the paragraph."""
+    frags = [norm(f) for f in re.split(r"\.\.\.|…|\[[^\]]*\]", quote)]
+    frags = [f for f in frags if len(f.split()) >= 4]
+    if not frags:
+        return None
+    p = norm(para)
+    return all(f in p for f in frags)
+
+
+def check_quotes(store, cand, tmp):
+    """Look up every quoted (publication, paragraph) in the corpus.
+    Returns {app: n_failed}, {app: n_ok}, {(app, "pub|para") that matched}."""
+    need = {}  # pub -> {para: [(app, quote)]}
+    for p in cand:
+        with gzip.open(p, "rt") as f:
+            for line in f:
+                r = json.loads(line)
+                for key, q in r.get("quotes", {}).items():
+                    pub, n = key.split("|")
+                    need.setdefault(pub, {}).setdefault(n, []).append((r["application"], q))
+    bad, good, verified = {}, {}, set()
+    for path in store.files("corpus/"):
+        local = store.get(path, os.path.join(tmp, "corp"))
+        with gzip.open(local, "rt") as f:
+            for line in f:
+                d = json.loads(line)
+                if d["pub"] not in need:
+                    continue
+                for n, items in need[d["pub"]].items():
+                    para = d["paragraphs"].get(n)
+                    for app, q in items:
+                        ok = quote_matches(q, para) if para else False
+                        if ok is True:
+                            good[app] = good.get(app, 0) + 1
+                            verified.add((app, d["pub"] + "|" + n))
+                        elif ok is False:
+                            bad[app] = bad.get(app, 0) + 1
+        os.remove(local)
+    return bad, good, verified
+
+
 def run_final(store, st, tmp):
     C.log("Final join ...")
     index = {}
@@ -311,9 +361,12 @@ def run_final(store, st, tmp):
                 b = best.get(r["application"])
                 if b is None or (r["kind"].startswith("A1") and not b.startswith("A1")):
                     best[r["application"]] = r["kind"] + "|" + r["publication"]
-    stats = {"applications": len(best), "rows": 0, "rejected_rows": 0, "no_reference_rows": 0, "answers": 0,
-             "scrapped_no_answer_in_corpus": 0, "answers_dropped_not_in_corpus": 0,
-             "corpus_publications": len(index)}
+    bad, good, verified = check_quotes(store, cand, tmp)
+    stats = {"applications": len(best), "rows": 0, "answers": 0, "rows_with_quote_verified_answer": 0,
+             "quoted_citations_checked": sum(bad.values()) + sum(good.values()),
+             "quoted_citations_matching": sum(good.values()),
+             "applications_dropped_quote_mismatch": len(bad), "scrapped_no_answer_in_corpus": 0,
+             "answers_dropped_not_in_corpus": 0, "corpus_publications": len(index)}
     writers, counts, shard_no, seen = {}, {"train": 0, "test": 0}, {"train": 0, "test": 0}, set()
     out_files = {}
 
@@ -335,23 +388,25 @@ def run_final(store, st, tmp):
                 if best[r["application"]] != r["kind"] + "|" + r["publication"] or r["id"] in seen:
                     continue
                 seen.add(r["id"])
-                if r["label"] == "rejected":
-                    good = [[q, n] for q, n in r["answers"] if q in index and C.in_ranges(index[q], n)]
-                    stats["answers_dropped_not_in_corpus"] += len(r["answers"]) - len(good)
-                    if not good:
-                        stats["scrapped_no_answer_in_corpus"] += 1
-                        continue
-                    r["answers"] = good
+                if r["application"] in bad:
+                    continue  # a quoted citation in this action did not match its paragraph: distrust the whole action
+                ok = [[q, n] for q, n in r["answers"] if q in index and C.in_ranges(index[q], n)]
+                stats["answers_dropped_not_in_corpus"] += len(r["answers"]) - len(ok)
+                if not ok:
+                    stats["scrapped_no_answer_in_corpus"] += 1
+                    continue
+                r["answers"] = ok
+                r["quote_verified"] = [[q, n] for q, n in ok if (r["application"], "%s|%d" % (q, n)) in verified]
                 family = fam.find(r["application"])
                 split = "test" if int(hashlib.sha1(family.encode()).hexdigest(), 16) % 20 == 0 else "train"
                 row = {k: r[k] for k in ("id", "application", "publication", "claim_number", "claim_text",
-                                         "claim_text_with_parents", "independent", "label", "answers",
+                                         "claim_text_with_parents", "independent", "answers", "quote_verified",
                                          "office_action_date", "art_unit")}
                 row["family"] = family
                 writer(split).write(json.dumps(row) + "\n")
                 counts[split] += 1
                 stats["rows"] += 1
-                stats["rejected_rows" if r["label"] == "rejected" else "no_reference_rows"] += 1
+                stats["rows_with_quote_verified_answer"] += bool(row["quote_verified"])
                 stats["answers"] += len(row["answers"])
         os.remove(p)
     for w in writers.values():
