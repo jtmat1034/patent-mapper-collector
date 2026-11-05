@@ -212,7 +212,9 @@ def candidate_rows(app, pub, kind, doc, db):
     for k, answers in a["labels"].items():
         if k not in cl:
             continue
-        text, independent = C.with_parents(cl, int(k))
+        text, independent, complete = C.with_parents(cl, int(k))
+        if not complete:
+            continue  # a claim it depends on is missing: the input would be incomplete
         q = {"%s|%d" % (r, n): quotes["%s|%d" % (r, n)] for r, n in answers if "%s|%d" % (r, n) in quotes}
         rows.append({"id": "%s-%s" % (app, k), "application": app, "publication": pub, "kind": kind,
                      "claim_number": int(k), "claim_text": cl[k][0], "claim_text_with_parents": text,

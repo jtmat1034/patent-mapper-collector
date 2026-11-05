@@ -402,11 +402,21 @@ def paragraphs(doc):
     return out
 
 
+DEP_TEXT = re.compile(r"\b(?:of|in|to|by|from|under|with|claimed\s+in|according\s+to|recited\s+in|defined\s+in|"
+                      r"set\s+forth\s+in)\s+(?:any\s+(?:one\s+)?of\s+|one\s+of\s+)?claims?\s+(\d+)", re.I)
+
+
 def claims(doc):
+    """{number: [text, parent number or None]}. The parent comes from the claim-ref tag, or failing that from
+    'of claim N' wording near the start of the claim."""
     out = {}
     for num, body in CLAIM.findall(doc):
         deps = [int(x) for x in CLAIM_DEP.findall(body)]
         t = re.sub(r"^\s*\d+\s*[.)]\s*", "", clean(body))
+        if not deps:
+            m = DEP_TEXT.search(t[:250])
+            if m and int(m.group(1)) < int(num):
+                deps = [int(m.group(1))]
         if len(t) >= 20 and not re.match(r"^\(?(?:canceled|cancelled|deleted)\)?\.?$", t, re.I):
             out[str(int(num))] = [t, deps[0] if deps else None]
     return out
@@ -545,12 +555,15 @@ def gz_rows(sub):
 
 
 def with_parents(cl, num):
+    """(claim text with every claim it depends on, root first; is independent; chain complete).
+    The chain is incomplete when a parent claim is missing from the publication or the references loop."""
     chain, seen, k = [], set(), num
     while k is not None and str(k) in cl and k not in seen:
         seen.add(k)
         chain.append(k)
         k = cl[str(k)][1]
-    return "\n".join("Claim %d: %s" % (c, cl[str(c)][0]) for c in reversed(chain)), len(chain) == 1
+    complete = k is None
+    return "\n".join("Claim %d: %s" % (c, cl[str(c)][0]) for c in reversed(chain)), len(chain) == 1, complete
 
 
 def build():
@@ -602,7 +615,10 @@ def build():
                 if not good:
                     stats["scrapped_no_answer_in_corpus"] += 1
                     continue
-            text, independent = with_parents(cl, int(k))
+            text, independent, complete = with_parents(cl, int(k))
+            if not complete:
+                stats["scrapped_claim_missing"] += 1
+                continue
             row = {"id": "%s-%s" % (app, k), "application": app, "publication": pub_self, "claim_number": int(k),
                    "claim_text": cl[k][0], "claim_text_with_parents": text, "independent": independent,
                    "label": "rejected" if kind is None else kind, "answers": good,
@@ -710,29 +726,40 @@ def cmd_test(cfg):
     os.remove(z)
     if not counts.get("kept"):
         raise SystemExit("No usable office actions found in the test file - send this output to Claude.")
-    log("TEST 3/3: one publication full-text file (claims + paragraphs)")
+    log("TEST 3/3: publication full-text files (claims, dependency chains, paragraphs)")
     pid = find_appxml_product(cfg)
     pf = product_files(pid, cfg)
-    g = pf[-1]
-    log("  %s: %d files, newest %s" % (pid, len(pf), g["fileName"]))
-    z = os.path.join(WORK, "test_" + g["fileName"])
-    download(g["fileDownloadURI"], z, cfg)
-    n, ok, shown = 0, 0, 0
-    for doc in split_docs(z):
-        n += 1
-        pub, kind, app = doc_ids(doc[:6000])
-        paras, cl = paragraphs(doc), claims(doc)
-        if pub and app and paras and cl:
-            ok += 1
-            if shown < 2:
-                k = sorted(paras)[min(5, len(paras) - 1)]
-                log("  example: pub %s %s app %s, %d claims, %d paragraphs; claim 1: %s | para %d: %s" % (
-                    pub, kind, app, len(cl), len(paras), cl.get("1", ["?"])[0][:150], k, paras[k][:150]))
-                shown += 1
-    os.remove(z)
-    log("  %d documents, %d with publication no., application no., claims and paragraphs" % (n, ok))
-    if not ok:
-        raise SystemExit("Could not read the publication file - send this output to Claude.")
+    log("  %s: %d files, oldest %s, newest %s" % (pid, len(pf), pf[0]["fileName"], pf[-1]["fileName"]))
+    picks = [int(x) for x in os.environ.get("PM_TEST_PUB", "-1").split(",") if x.strip()]
+    for i in picks:
+        g = pf[i]
+        z = os.path.join(WORK, "test_" + g["fileName"])
+        download(g["fileDownloadURI"], z, cfg)
+        n = ok = shown = n_claims = deps = broken = 0
+        for doc in split_docs(z):
+            n += 1
+            pub, kind, app = doc_ids(doc[:6000])
+            paras, cl = paragraphs(doc), claims(doc)
+            if pub and app and paras and cl:
+                ok += 1
+                for k in cl:
+                    n_claims += 1
+                    _, indep, complete = with_parents(cl, int(k))
+                    deps += not indep
+                    broken += not complete
+                if shown < 1:
+                    dep = next((k for k in sorted(cl, key=int) if cl[k][1]), None)
+                    k = sorted(paras)[min(5, len(paras) - 1)]
+                    log("  example: pub %s %s app %s, %d claims, %d paragraphs | para %d: %s" % (
+                        pub, kind, app, len(cl), len(paras), k, paras[k][:120]))
+                    if dep:
+                        log("    dependent claim %s with parents: %s" % (dep, with_parents(cl, int(dep))[0][:300]))
+                    shown += 1
+        os.remove(z)
+        log("  [%s] %d documents, %d with pub no., app no., claims and paragraphs; %d claims, %d dependent, "
+            "%d with a broken dependency chain" % (g["fileName"], n, ok, n_claims, deps, broken))
+        if not ok:
+            raise SystemExit("Could not read publication file %s - send this output to Claude." % g["fileName"])
     log("ALL TESTS PASSED. Free disk: %.0f GB" % free_gb())
 
 
