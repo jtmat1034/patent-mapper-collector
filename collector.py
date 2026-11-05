@@ -857,7 +857,7 @@ def app_pub_info(app, cfg):
     """(publication number, publication date) of an application, from the Open Data Portal."""
     d = get_json("%s/api/v1/patent/applications/%s" % (API, app), cfg) or {}
     kv = find_pub_strings(d, [])
-    nums = [digits(v) for k, v in kv if "umber" in k and len(digits(v)) == 11]
+    nums = [m.group(1) for k, v in kv if "umber" in k for m in [re.search(r"(?<!\d)(\d{11})(?!\d)", v)] if m]
     dates = [v[:10] for k, v in kv if "ate" in k and re.match(r"\d{4}-\d\d-\d\d", v)]
     return (nums[0] if nums else None), (min(dates) if dates else None), kv
 
