@@ -374,6 +374,9 @@ def main(store=None):
     os.makedirs(tmp, exist_ok=True)
     store = store or HFStore()
     st = load_state(store, tmp)
+    if st.get("parser") != C.P.VERSION:  # labels were made by an older parser: redo them (files are overwritten)
+        C.log("Parser version changed (%s -> %s): re-parsing all office actions" % (st.get("parser"), C.P.VERSION))
+        st.update({"parser": C.P.VERSION, "oact_done": [], "appxml_done": [], "final_done": False})
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         print(json.dumps({"oact_done": len(st["oact_done"]), "appxml_done": len(st["appxml_done"]),
                           "final_done": st["final_done"]}))

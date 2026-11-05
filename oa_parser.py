@@ -9,6 +9,8 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
+VERSION = 2  # bump when labels change; the cloud run then re-parses every office-action file
+
 # --- reference numbers ----------------------------------------------------------------
 
 # US 2012/0175451, US 20120175451, US 2012-0175451, U.S. Pub. No. 2012/0175451, 2012/0175451 A1
@@ -18,6 +20,9 @@ NAME_THEN_PUB = re.compile(
     r"([A-Z][A-Za-z'\-]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][A-Za-z'\-]+))?)"
     r"[\s,(\[]*(?:hereinafter[^)]*?)?(?:U\.?\s?S\.?\s*)?(?:(?:Pat(?:ent)?\.?\s*)?(?:App(?:lication|l)?\.?\s*)?"
     r"(?:Pub(?:lication|l)?\.?\s*)?(?:No\.?\s*)?)?((?:19|20)\d\d\s*[/\-]?\s*\d{7})")
+# Granted US patents (6,243,581 / US 6243581 B1 / U.S. Pat. No. 10,123,456): cited by column/line, never by
+# paragraph, so they are tracked only to keep their citations from being credited to a publication.
+GRANTED = re.compile(r"(?<![\d,/.])(?:\d{1,2},\d{3},\d{3}|(?<=US)\s?\d{7,8}(?=\s*B\d)|(?<=US )\d{7,8}(?=\s*B\d))(?![\d,])")
 # 'Yanagawa '451' style shorthand
 SHORT = re.compile(r"([A-Z][A-Za-z'\-]+)\s*[‘’'`]\s*(\d{3})\b")
 
@@ -118,6 +123,10 @@ def reference_index(text):
         alias = ALIAS.match(text[m.end():m.end() + 60])
         if alias:
             by_name.setdefault(alias.group(1).lower(), pub)
+    for m in GRANTED.finditer(text):
+        name = surname_before(text, m.start())
+        if name:
+            by_name.setdefault(name.lower(), "GRANT")
     return by_name, by_suffix
 
 
@@ -138,6 +147,8 @@ def mentions(segment, by_name, by_suffix, ends=None):
         pub = norm_pub(m.group(1) + m.group(2))
         if pub:
             found.append((m.start(), "AAPA" if is_foreign(segment, m.start()) else pub)); ends[m.start()] = m.end()
+    for m in GRANTED.finditer(segment):
+        found.append((m.start(), "GRANT")); ends[m.start()] = m.end()
     for m in SHORT.finditer(segment):
         pub = by_suffix.get(m.group(2))
         if pub:
@@ -182,19 +193,19 @@ def paragraph_cites(segment, max_span=None):
     for t in TRIGGER.finditer(segment):
         m = NUM_RUN.match(segment, t.end())
         if m:
-            out.append((t.start(), expand_run(m.group(0), max_span)))
+            out.append((t.start(), expand_run(m.group(0), max_span), m.end()))
             taken.append((t.start(), m.end()))
     for m in INNER_RANGE.finditer(segment):
         if free(m.start(), m.end()):
-            out.append((m.start(), expand_run(m.group(1) + "-" + m.group(2), max_span)))
+            out.append((m.start(), expand_run(m.group(1) + "-" + m.group(2), max_span), m.end()))
             taken.append((m.start(), m.end()))
     for m in BRACKET_RUN.finditer(segment):
         if free(m.start(), m.end()):
-            out.append((m.start(), expand_run(m.group(0), max_span)))
+            out.append((m.start(), expand_run(m.group(0), max_span), m.end()))
             taken.append((m.start(), m.end()))
     for m in ZERO_RUN.finditer(segment):
         if free(m.start(), m.end()):
-            out.append((m.start(), expand_run(m.group(0).replace(";", ","), max_span)))
+            out.append((m.start(), expand_run(m.group(0).replace(";", ","), max_span), m.end()))
             taken.append((m.start(), m.end()))
     return sorted(out)
 
@@ -217,7 +228,11 @@ def attribute(seg, pos, refs, mention_ends, strict):
     if pos - mention_ends.get(last_pos, last_pos) <= NEAR:
         return last_pub  # 'Smith, ¶ [0024]' / '(Smith; para 24)'
     if strict:
-        return None  # several references and none named next to the citation: drop it
+        # several references: credit the one named last, only if it is in the same sentence as the citation
+        between = seg[mention_ends.get(last_pos, last_pos):pos]
+        if not re.search(r"\.\s+[A-Z]|\n", between):
+            return last_pub
+        return None
     for p, pub in reversed(before):
         if VERB.match(seg, mention_ends.get(p, p)):
             sent_start = max(seg.rfind(".", 0, p) + 1, seg.rfind("\n", 0, p) + 1, 0)
@@ -226,6 +241,33 @@ def attribute(seg, pos, refs, mention_ends, strict):
                 return chain[0][1]
             return pub
     return last_pub
+
+
+SELF_AFTER = re.compile(r"^[\s\]\)]*(?:above|supra|herein|of\s+(?:this|the\s+(?:present|instant|current|pending|subject))\s+"
+                        r"(?:office\s+)?(?:action|disclosure|specification|application|spec)|"
+                        r"of\s+(?:the\s+)?applicant'?s?)", re.I)
+SELF_BEFORE = re.compile(r"(?:instant|present|applicant'?s?|pending|subject|this)\s+(?:office\s+action|action|disclosure|"
+                         r"specification|application|spec|publication)\s*(?:,|at|in|see)?\s*(?:\(\s*)?$|"
+                         r"\b(?:above|supra|previously)\s*(?:,|at|in)?\s*$", re.I)
+
+
+def self_citation(seg, pos, run_end):
+    """True when a paragraph number points into the office action itself or the applicant's own filing."""
+    return bool(SELF_AFTER.match(seg[run_end:run_end + 60]) or SELF_BEFORE.search(seg[max(0, pos - 60):pos]))
+
+
+CLAUSE_CLAIMS = re.compile(r"\bclaims?\s+(\d+(?:\s*(?:-|–|to|through|,(?:\s*and)?|and|&)\s*\d+)*)", re.I)
+
+
+def clause_claims(seg, pos, section_claims):
+    """Section claims named in the clause around a citation (';' '.' and line breaks end a clause)."""
+    a = max(seg.rfind(";", 0, pos), seg.rfind(".", 0, pos - 1), seg.rfind("\n", 0, pos))
+    ends = [x for x in (seg.find(";", pos), seg.find(".", pos + 1), seg.find("\n", pos)) if x > 0]
+    b = min(ends) if ends else len(seg)
+    named = set()
+    for m in CLAUSE_CLAIMS.finditer(seg[a + 1:b]):
+        named.update(claim_numbers(m.group(1)))
+    return named & set(section_claims)
 
 
 LATER_CLAIM = re.compile(r"\bclaims?\s+(\d+)", re.I)
@@ -290,15 +332,17 @@ def parse_office_action(text, strict=True):
         if not refs:
             prior_start = events[k - 1][0]
             pa = bisect.bisect_left(ref_pos, prior_start)
-            prev = [r for r in all_refs[pa:a] if r[1] != "AAPA"]
+            prev = [r for r in all_refs[pa:a] if r[1] not in ("AAPA", "GRANT")]
             refs = [(-1, prev[-1][1])] if prev else []
         if not refs:
             continue
-        pairs = set()
-        for pos, nums in paragraph_cites(seg, STRICT_MAX_SPAN if strict else None):
+        per_claim = {}
+        for pos, nums, run_end in paragraph_cites(seg, STRICT_MAX_SPAN if strict else None):
             pub = attribute(seg, pos, refs, ends, strict)
-            if pub is None or pub == "AAPA":
+            if pub is None or pub in ("AAPA", "GRANT"):
                 continue
+            if self_citation(seg, pos, run_end):
+                continue  # 'paragraph 6 of this office action', 'paragraph 13 of the instant disclosure'
             if strict and unknown_name_before(seg, pos, by_name):
                 continue  # a reference we could not identify is named next to this citation
             if strict:
@@ -306,9 +350,12 @@ def parse_office_action(text, strict=True):
                 s1 = seg.find(".", pos + 1)
                 if NEGATIVE.search(seg[s0 + 1:s1 if s1 > 0 else len(seg)]):
                     continue  # citation sits in a 'does not teach' sentence
-            pairs.update((pub, n) for n in nums if 0 < n < 2000)
-        if pairs:
-            for c in claims:
+            # in a section covering several claims, a citation tied to particular claims goes to those claims only
+            targets = (clause_claims(seg, pos, claims) if len(claims) > 1 else set()) or claims
+            for c in targets:
+                per_claim.setdefault(c, set()).update((pub, n) for n in nums if 0 < n < 2000)
+        for c, pairs in per_claim.items():
+            if pairs:
                 labels.setdefault(c, set()).update(pairs)
     return labels
 
