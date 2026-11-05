@@ -362,7 +362,7 @@ OLD_PUB = re.compile(r"<document-id>\s*<doc-number>\s*(\d{11})\s*</doc-number>\s
 OLD_APP = re.compile(r"<application-number>\s*<doc-number>\s*([^<]+?)\s*</doc-number>", re.S)
 PARA = re.compile(r'<p\b[^>]*\bnum="(\d+)"[^>]*>(.*?)</p>', re.S)
 OLD_PARA = re.compile(r"<paragraph\b[^>]*>(.*?)</paragraph>", re.S)
-OLD_NUM = re.compile(r"<number>\s*\[?\s*(\d+)\s*\]?\s*</number>")
+OLD_NUM = re.compile(r"<number>\s*(?:&lsqb;|\[)?\s*(\d+)\s*(?:&rsqb;|\])?\s*\.?\s*</number>")
 CLAIM = re.compile(r'<claim\s+id="CLM-(\d+)"[^>]*>(.*?)</claim>', re.S)
 CLAIM_DEP = re.compile(r'(?:idref|depends_on)="CLM-(\d+)"')
 DESC = re.compile(r"<description\b.*?</description>|<subdoc-description\b.*?</subdoc-description>", re.S)
@@ -394,9 +394,10 @@ def paragraphs(doc):
             out.setdefault(int(num), t)
     if not out:
         for txt in OLD_PARA.findall(body):
-            n = OLD_NUM.search(txt)
+            txt = txt.lstrip()
+            n = OLD_NUM.match(txt)  # the printed number must open the paragraph
             if n:
-                t = clean(OLD_NUM.sub(" ", txt))
+                t = clean(txt[n.end():])
                 if t:
                     out.setdefault(int(n.group(1)), t)
     return out
