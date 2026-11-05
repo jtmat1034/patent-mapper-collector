@@ -149,19 +149,23 @@ def digits(s):
 # --- bulk product listings --------------------------------------------------------------------
 
 def product_files(pid, cfg):
-    files, offset = [], 0
+    """Every data file of a bulk product. The API pages 100 files at a time; productFileTotalQuantity is the total."""
+    files, seen, offset, total = [], set(), 0, None
     while True:
         d = get_json("%s/api/v1/datasets/products/%s?includeFiles=true&offset=%d&limit=100" % (API, pid, offset), cfg)
         if not d or not d.get("bulkDataProductBag"):
             break
-        bag = d["bulkDataProductBag"][0].get("productFileBag") or {}
-        page = bag.get("fileDataBag") or []
-        new = [f for f in page if f.get("fileDownloadURI") not in {g.get("fileDownloadURI") for g in files}]
+        prod = d["bulkDataProductBag"][0]
+        if total is None:
+            total = prod.get("productFileTotalQuantity") or 0
+        page = (prod.get("productFileBag") or {}).get("fileDataBag") or []
+        new = [f for f in page if f.get("fileDownloadURI") and f["fileDownloadURI"] not in seen]
+        for f in new:
+            seen.add(f["fileDownloadURI"])
         files += new
-        count = bag.get("count") or 0
-        if not new or len(files) >= count:
+        offset += len(page)
+        if not new or not page or offset >= total:
             break
-        offset = len(files)
     files = [f for f in files if (f.get("fileTypeText") or "Data") == "Data" and f.get("fileDownloadURI")]
     files.sort(key=lambda f: f.get("fileDataFromDate") or f.get("fileName"))
     return files
@@ -188,12 +192,12 @@ OA_CODES = {"CTNF"}  # first-action non-final rejections (see module docstring)
 
 
 def oa_records(obj):
-    """Yield office-action dicts from any JSON layout (list, {docs: [...]}, nested)."""
+    """Yield office-action dicts from any JSON layout (one record, list, {docs: [...]}, nested)."""
     stack = [obj]
     while stack:
         o = stack.pop()
         if isinstance(o, dict):
-            if "bodyText" in o and ("patentApplicationNumber" in o or "applicationNumberText" in o):
+            if ("oaText" in o or "bodyText" in o) and ("patentApplicationNumber" in o or "applicationNumberText" in o):
                 yield o
             else:
                 stack.extend(v for v in o.values() if isinstance(v, (dict, list)))
@@ -201,8 +205,30 @@ def oa_records(obj):
             stack.extend(x for x in o if isinstance(x, (dict, list)))
 
 
+def json_stream(f):
+    """Parse a JSON-lines stream one line at a time; if the file is a single JSON document, parse it whole."""
+    head, objs = [], 0
+    for line in f:
+        s = line.strip().rstrip(b",")
+        if not s.startswith(b"{"):
+            if objs == 0:
+                head.append(line)
+            continue
+        try:
+            o = json.loads(s)
+        except ValueError:
+            if objs == 0:
+                head.append(line)
+            continue
+        objs += 1
+        yield o
+    if objs == 0 and head:
+        for o in parse_json_bytes(b"".join(head)):
+            yield o
+
+
 def json_members(zpath):
-    """Yield parsed JSON objects from a zip (json, jsonl, or nested zip members)."""
+    """Yield parsed JSON objects from a zip (json / jsonl members, or nested zips), streaming."""
     with zipfile.ZipFile(zpath) as z:
         for name in z.namelist():
             low = name.lower()
@@ -210,11 +236,13 @@ def json_members(zpath):
                 with zipfile.ZipFile(io.BytesIO(z.read(name))) as z2:
                     for n2 in z2.namelist():
                         if n2.lower().endswith((".json", ".jsonl")):
-                            for o in parse_json_bytes(z2.read(n2)):
-                                yield o
+                            with z2.open(n2) as f:
+                                for o in json_stream(f):
+                                    yield o
             elif low.endswith((".json", ".jsonl", ".txt")):
-                for o in parse_json_bytes(z.read(name)):
-                    yield o
+                with z.open(name) as f:
+                    for o in json_stream(f):
+                        yield o
 
 
 def parse_json_bytes(b):
@@ -235,10 +263,12 @@ def parse_json_bytes(b):
 
 def oa_row(rec):
     """Parse one office-action record -> label row, or (None, reason)."""
-    code = first(rec.get("legacyDocumentCodeIdentifier"))
+    sec = rec.get("sections") if isinstance(rec.get("sections"), dict) else {}
+    code = first(rec.get("documentCode") or rec.get("legacyDocumentCodeIdentifier")
+                 or sec.get("legacyDocumentCodeIdentifier"))
     if code not in OA_CODES:
         return None, "not_ctnf"
-    text = rec.get("bodyText")
+    text = rec.get("oaText") or rec.get("bodyText")
     if isinstance(text, list):
         text = "\n".join(t for t in text if isinstance(t, str))
     if not text or len(text) < 500:
@@ -256,8 +286,8 @@ def oa_row(rec):
     pending_max = max(int(x) for x in re.findall(r"\d+", m.group(1))) if m else None
     return {
         "app": app,
-        "date": (first(rec.get("submissionDate")) or "")[:10],
-        "art_unit": str(first(rec.get("groupArtUnitNumber")) or ""),
+        "date": (first(rec.get("submissionDate") or sec.get("submissionDate")) or "")[:10],
+        "art_unit": str(first(rec.get("groupArtUnitNumber") or sec.get("groupArtUnitNumber")) or ""),
         "pending_max": pending_max,
         "labels": {str(k): sorted([p, n] for p, n in v) for k, v in labels.items()},
         "no_reference": {str(k): v for k, v in allow.items()},
@@ -286,7 +316,7 @@ def stage_oact(cfg, st, limit=None):
                     if row:
                         g.write(json.dumps(row) + "\n")
                         if n_samples < 20:  # a few raw actions kept for spot-checking the labels
-                            t = rec.get("bodyText")
+                            t = rec.get("oaText") or rec.get("bodyText")
                             samp.write(json.dumps({"app": row["app"], "date": row["date"],
                                                    "text": "\n".join(t) if isinstance(t, list) else t}) + "\n")
                             n_samples += 1

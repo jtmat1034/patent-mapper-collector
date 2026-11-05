@@ -150,7 +150,7 @@ def run_oact(store, st, cfg, tmp):
                     if row:
                         g.write(json.dumps(row) + "\n")
                         if n_s < 20:
-                            t = rec.get("bodyText")
+                            t = rec.get("oaText") or rec.get("bodyText")
                             gs.write(json.dumps({"app": row["app"], "date": row["date"], "row": row,
                                                  "text": "\n".join(t) if isinstance(t, list) else t}) + "\n")
                             n_s += 1
