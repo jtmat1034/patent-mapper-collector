@@ -47,6 +47,7 @@ jobs:
         env:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           PM_SPOT_N: "4"
+          PM_SPOT_APPS: ${{ github.event.inputs.pub_files }}
         run: python -c "import os,collector as C; os.makedirs(C.WORK,exist_ok=True); C.cmd_spotcheck(C.curl_config(os.environ['USPTO_API_KEY']), int(os.environ['PM_SPOT_N']))"
       - name: Build
         id: build

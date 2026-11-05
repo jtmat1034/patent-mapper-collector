@@ -905,6 +905,18 @@ def cmd_spotcheck(cfg, n_actions=3, seed=None):
             if row:
                 kept.append((row, rec.get("oaText") or rec.get("bodyText")))
     os.remove(z)
+    only = [a.strip() for a in os.environ.get("PM_SPOT_APPS", "").split(",") if a.strip()]
+    if only:
+        for row, text in kept:
+            if row["app"] in only:
+                log("=" * 100)
+                log("CITATION CONTEXT for %s: labels %s" % (row["app"], json.dumps(row["labels"])[:1500]))
+                for ref in sorted({r for v in row["labels"].values() for r, _ in v}):
+                    for m in re.finditer(ref[:4] + r"\s*[/\-]?\s*" + ref[4:], text):
+                        log("  ref named: ..." + re.sub(r"\s+", " ", text[max(0, m.start() - 150):m.end() + 100]))
+                for m in re.finditer(r"(?:\[\s*0*(?:3|6|9)\s*\]|¶+\s*\[?0*(?:3|6|9)\b|para(?:graph)?s?\.?\s*\[?0*(?:3|6|9)\b)", text):
+                    log("  cite: ..." + re.sub(r"\s+", " ", text[max(0, m.start() - 450):m.end() + 60]))
+        return
     log("SPOT CHECK: %d kept rejections in %s; picking %d at random" % (len(kept), f["fileName"], n_actions))
     pf = product_files(find_appxml_product(cfg), cfg)
     cache = {}
