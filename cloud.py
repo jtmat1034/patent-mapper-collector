@@ -66,10 +66,11 @@ class HFStore:
                           token=self.api.token, max_workers=8)
         return sorted(glob.glob(os.path.join(dest_dir, prefix + "*")))
 
-    def put(self, files, message):
-        """files: {repo_path: local_path}; one atomic commit, retried."""
-        from huggingface_hub import CommitOperationAdd
+    def put(self, files, message, delete=()):
+        """files: {repo_path: local_path}; delete: repo paths to remove; one atomic commit, retried."""
+        from huggingface_hub import CommitOperationAdd, CommitOperationDelete
         ops = [CommitOperationAdd(path_in_repo=k, path_or_fileobj=v) for k, v in files.items()]
+        ops += [CommitOperationDelete(path_in_repo=k) for k in delete]
         for attempt in range(6):
             try:
                 self.api.create_commit(self.repo, repo_type="dataset", operations=ops, commit_message=message)
@@ -106,7 +107,10 @@ class LocalStore:
     def get_prefix(self, prefix, dest_dir):
         return [self.get(p, dest_dir) for p in self.files(prefix)]
 
-    def put(self, files, message):
+    def put(self, files, message, delete=()):
+        for k in delete:
+            if os.path.exists(os.path.join(self.root, k)):
+                os.remove(os.path.join(self.root, k))
         for k, v in files.items():
             dst = os.path.join(self.root, k)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -389,10 +393,41 @@ def quote_matches(quote, para):
     return all(f in p for f in frags)
 
 
+def shingles(t, n=4):
+    w = norm(t).split()
+    return {" ".join(w[i:i + n]) for i in range(max(0, len(w) - n + 1))}
+
+
+def is_claim_quote(quote, claim_text):
+    """True when the quoted words are (nearly all) the claim's own wording, i.e. the examiner quoted the claim."""
+    q = shingles(quote)
+    if not q:
+        return norm(quote).strip() in norm(claim_text)
+    return len(q & shingles(claim_text)) >= 0.8 * len(q)
+
+
+AUDIT_N = int(os.environ.get("PM_AUDIT_N", "1000"))
+
+
+AUDIT = {}
+
+
 def check_quotes(store, cand, tmp):
     """Look up every quoted (publication, paragraph) in the corpus.
     Returns {app: n_failed}, {app: n_ok}, {(app, "pub|para") that matched}."""
     need = {}  # pub -> {para: [(app, quote)]}
+    claim_quotes = 0
+    # audit pool: one random claim row per application that has a saved office-action sample
+    sample_apps = set()
+    for path in store.files("work/samples/"):
+        local = store.get(path, os.path.join(tmp, "samp"))
+        with gzip.open(local, "rt") as f:
+            for line in f:
+                try:
+                    sample_apps.add(json.loads(line)["app"])
+                except Exception:
+                    continue
+    audit_pick = {}  # app -> (score, row id, answers)
     for p in cand:
         with gzip.open(p, "rt") as f:
             for line in f:
@@ -400,9 +435,28 @@ def check_quotes(store, cand, tmp):
                     r = json.loads(line); r["application"]
                 except Exception:
                     continue
+                if r["application"] in sample_apps:
+                    sc = hashlib.sha1(r["id"].encode()).hexdigest()
+                    old = audit_pick.get(r["application"])
+                    if old is None or sc < old[0]:
+                        audit_pick[r["application"]] = (sc, r["id"], r["answers"])
                 for key, q in r.get("quotes", {}).items():
-                    pub, n = key.split("|")
+                    try:
+                        if is_claim_quote(q, r.get("claim_text_with_parents") or r.get("claim_text") or ""):
+                            claim_quotes += 1
+                            continue  # the examiner quoted the claim, not the reference: treat as no quote
+                        pub, n = key.split("|")
+                    except Exception:
+                        continue
                     need.setdefault(pub, {}).setdefault(n, []).append((r["application"], q))
+    pool = sorted(audit_pick.values())[:int(AUDIT_N * 1.6)]
+    AUDIT["ids"] = {x[1] for x in pool}
+    want = {}
+    for _, _, answers in pool:
+        for q, n in answers:
+            want.setdefault(q, set()).add(str(n))
+    AUDIT["paras"] = {}
+    AUDIT["claim_quotes"] = claim_quotes
     bad, good, verified = {}, {}, set()
     for path in store.files("corpus/"):
         local = store.get(path, os.path.join(tmp, "corp"))
@@ -412,6 +466,10 @@ def check_quotes(store, cand, tmp):
                     d = json.loads(line); d["pub"], d["paragraphs"]
                 except Exception:
                     continue
+                if d["pub"] in want:
+                    for n in want[d["pub"]]:
+                        if n in d["paragraphs"]:
+                            AUDIT["paras"]["%s|%s" % (d["pub"], n)] = d["paragraphs"][n]
                 if d["pub"] not in need:
                     continue
                 for n, items in need[d["pub"]].items():
@@ -455,9 +513,11 @@ def run_final(store, st, tmp):
                 if b is None or (r["kind"].startswith("A1") and not b.startswith("A1")):
                     best[r["application"]] = r["kind"] + "|" + r["publication"]
     bad, good, verified = check_quotes(store, cand, tmp)
+    audit_rows = []
     stats = {"applications": len(best), "rows": 0, "answers": 0, "rows_with_quote_verified_answer": 0,
              "quoted_citations_checked": sum(bad.values()) + sum(good.values()),
              "quoted_citations_matching": sum(good.values()),
+             "claim_language_quotes_ignored": AUDIT.get("claim_quotes", 0),
              "applications_dropped_quote_mismatch": len(bad), "scrapped_cited_paragraph_missing": 0,
              "unreadable_rows": 0, "corpus_publications": len(index)}
     writers, counts, shard_no, seen = {}, {"train": 0, "test": 0}, {"train": 0, "test": 0}, set()
@@ -496,6 +556,9 @@ def run_final(store, st, tmp):
                                              "office_action_date", "art_unit")}
                     row["family"] = family
                     writer(split).write(json.dumps(row) + "\n")
+                    if r["id"] in AUDIT.get("ids", ()) and len(audit_rows) < AUDIT_N:
+                        audit_rows.append(dict(row, split=split, cited_paragraph_text={
+                            "%s|%d" % (q, n): AUDIT["paras"].get("%s|%d" % (q, n)) for q, n in row["answers"]}))
                     counts[split] += 1
                     stats["rows"] += 1
                     stats["rows_with_quote_verified_answer"] += bool(row["quote_verified"])
@@ -505,6 +568,24 @@ def run_final(store, st, tmp):
         os.remove(p)
     for w in writers.values():
         w.close()
+    audit_apps = {r["application"] for r in audit_rows}
+    texts = {}
+    for local in glob.glob(os.path.join(tmp, "samp", "work", "samples", "*.jsonl.gz")):
+        with gzip.open(local, "rt") as f:
+            for line in f:
+                try:
+                    x = json.loads(line)
+                except Exception:
+                    continue
+                if x.get("app") in audit_apps and x.get("text"):
+                    texts.setdefault(x["app"], x["text"])
+    ap = os.path.join(tmp, "audit.jsonl.gz")
+    with gzip.open(ap, "wt") as f:
+        for r in audit_rows:
+            r["office_action_text"] = texts.get(r["application"])
+            f.write(json.dumps(r) + "\n")
+    out_files["audit/audit.jsonl.gz"] = ap
+    C.log("Audit sample: %d rows" % len(audit_rows))
     sp = os.path.join(tmp, "stats.json")
     with open(sp, "w") as f:
         json.dump(stats, f, indent=1)
@@ -513,7 +594,8 @@ def run_final(store, st, tmp):
     out_files["evaluate.py"] = os.path.join(HERE, "evaluate.py")
     st["final_done"] = True
     out_files["state/state.json"] = state_file(st, tmp)
-    store.put(out_files, "final dataset")
+    stale = [f for f in store.files("train/") + store.files("test/") if f not in out_files]
+    store.put(out_files, "final dataset", delete=stale)
     C.log("Done:", json.dumps(stats))
     return stats
 
@@ -530,6 +612,10 @@ def main(store=None):
         print(json.dumps({"oact_done": len(st["oact_done"]), "appxml_done": len(st["appxml_done"]),
                           "final_done": st["final_done"]}))
         return "status"
+    if len(sys.argv) > 1 and sys.argv[1] == "rejoin":
+        run_final(store, st, tmp)
+        shutil.copyfile(os.path.join(tmp, "audit.jsonl.gz"), os.path.join(HERE, "audit.jsonl.gz"))
+        return "complete"
     if st["final_done"]:
         C.log("Dataset already complete.")
         return "complete"

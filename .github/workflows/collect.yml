@@ -8,7 +8,7 @@ on:
         description: "test = check the API key and real file formats; run = build"
         default: run
         type: choice
-        options: [run, test, spotcheck]
+        options: [run, test, spotcheck, rejoin]
       pub_files:
         description: "test mode: which publication files to check (0 = oldest, -1 = newest)"
         default: "-1"
@@ -49,9 +49,20 @@ jobs:
           PM_SPOT_N: "4"
           PM_SPOT_APPS: ${{ github.event.inputs.pub_files }}
         run: python -c "import os,collector as C; os.makedirs(C.WORK,exist_ok=True); C.cmd_spotcheck(C.curl_config(os.environ['USPTO_API_KEY']), int(os.environ['PM_SPOT_N']))"
+      - name: Rebuild the final dataset (no re-scrape)
+        if: ${{ github.event.inputs.mode == 'rejoin' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python cloud.py rejoin
+      - name: Upload audit sample
+        if: ${{ github.event.inputs.mode == 'rejoin' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit
+          path: audit.jsonl.gz
       - name: Build
         id: build
-        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' }}
+        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' && github.event.inputs.mode != 'rejoin' }}
         env:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
