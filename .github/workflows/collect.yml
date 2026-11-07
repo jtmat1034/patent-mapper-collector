@@ -8,7 +8,7 @@ on:
         description: "test = check the API key and real file formats; run = build"
         default: run
         type: choice
-        options: [run, test, spotcheck, rejoin]
+        options: [run, test, spotcheck, rejoin, auditdump]
       pub_files:
         description: "test mode: which publication files to check (0 = oldest, -1 = newest)"
         default: "-1"
@@ -60,9 +60,19 @@ jobs:
         with:
           name: audit
           path: audit.jsonl.gz
+      - name: Print the audit sample into the log
+        if: ${{ github.event.inputs.mode == 'auditdump' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -c "import cloud; s=cloud.HFStore(); print(s.get('audit/audit.jsonl.gz', '.'))"
+          python tools/make_batches.py audit/audit.jsonl.gz batches 25
+          tar czf audit_batches.tgz batches
+          base64 -w 2000 audit_batches.tgz | sed 's/^/AUDITB64:/'
+          sha256sum audit_batches.tgz
       - name: Build
         id: build
-        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' && github.event.inputs.mode != 'rejoin' }}
+        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' && github.event.inputs.mode != 'rejoin' && github.event.inputs.mode != 'auditdump' }}
         env:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
