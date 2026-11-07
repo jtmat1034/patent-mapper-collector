@@ -467,6 +467,7 @@ def parse_office_action_full(text, strict=True):
 # --- strict parser: no fallbacks; any ambiguity anywhere drops the whole office action ---------
 
 NON_ANSWER = ("AAPA", "GRANT", "OTHER")
+GROUP_STRICT = True  # a citation in a section covering several claims must name the claim it is for
 ATTACH_GAP = re.compile(r"^[\s,:;(\[]*(?:et\s+al\.?[\s,]*)?(?:[‘’'`]\s*\d{3}[\s,]*)?(?:\([^)]{0,40}\)[\s,]*)?"
                         r"(?:(?:at|in|see|e\.g\.,?|i\.e\.,?|teaches|discloses|shows|describes|recites|para(?:graph)?s?\.?|¶+|"
                         r"[A-Za-z]+\.?\s+\d+[A-Za-z]?,?)\s*)*$", re.I)
@@ -572,6 +573,8 @@ def parse_office_action_strict(text):
             if not nums:
                 return {}, {}, "unreadable_paragraph_number"
             named = clause_claims(seg, pos, claims) if len(claims) > 1 else set()
+            if len(claims) > 1 and not named and GROUP_STRICT:
+                return {}, {}, "group_section_citation_claim_unnamed"
             if specific and not named:
                 return {}, {}, "citation_claim_unclear"
             for c in named or claims:
