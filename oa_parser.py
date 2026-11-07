@@ -318,9 +318,10 @@ def self_citation(seg, pos, run_end):
 CLAUSE_CLAIMS = re.compile(r"\bclaims?\s+(\d+(?:\s*(?:-|–|to|through|,(?:\s*and)?|and|&)\s*\d+)*)", re.I)
 
 
-def clause_claims(seg, pos, section_claims):
-    """Section claims named in the clause around a citation (';' '.' and line breaks end a clause)."""
-    a = max(seg.rfind(";", 0, pos), seg.rfind(".", 0, pos - 1), seg.rfind("\n", 0, pos))
+def clause_claims(seg, pos, section_claims, head_end=0):
+    """Section claims named in the clause around a citation (';' '.' and line breaks end a clause).
+    The section heading itself ('Regarding claims 5-7') does not count as naming a claim."""
+    a = max(seg.rfind(";", 0, pos), seg.rfind(".", 0, pos - 1), seg.rfind("\n", 0, pos), head_end - 1)
     ends = [x for x in (seg.find(";", pos), seg.find(".", pos + 1), seg.find("\n", pos)) if x > 0]
     b = min(ends) if ends else len(seg)
     named = set()
@@ -547,7 +548,8 @@ def parse_office_action_strict(text):
             continue
         if not refs:
             return {}, {}, "section_names_no_reference"
-        specific = len(claims) > 1 and any(clause_claims(seg, pos, claims) for pos, _, _ in cites)
+        head_end = h.end() - h.start()
+        specific = len(claims) > 1 and any(clause_claims(seg, pos, claims, head_end) for pos, _, _ in cites)
         per_claim = {}
         for pos, nums, run_end in cites:
             if self_citation(seg, pos, run_end):
@@ -572,7 +574,7 @@ def parse_office_action_strict(text):
             nums = [n for n in nums if 0 < n < 2000]
             if not nums:
                 return {}, {}, "unreadable_paragraph_number"
-            named = clause_claims(seg, pos, claims) if len(claims) > 1 else set()
+            named = clause_claims(seg, pos, claims, head_end) if len(claims) > 1 else set()
             if len(claims) > 1 and not named and GROUP_STRICT:
                 return {}, {}, "group_section_citation_claim_unnamed"
             if specific and not named:
