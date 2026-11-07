@@ -24,8 +24,7 @@ NAME_THEN_PUB = re.compile(
 # paragraph, so they are tracked only to keep their citations from being credited to a publication.
 GRANTED = re.compile(r"(?<![\d,/.])(?:\d{1,2},\d{3},\d{3}|(?<=US)\s?\d{7,8}(?=\s*B\d)|(?<=US )\d{7,8}(?=\s*B\d))(?![\d,])")
 # the reference list of a rejection statement, split into one chunk per reference
-STATEMENT_REFS = re.compile(r"(?:unpatentable\s+over|obvious\s+over|anticipated\s+by|anticipated\s+over)\s+(.{0,700}?)"
-                            r"(?=\.\s+[A-Z]|\n|$)", re.I | re.S)
+STATEMENT_START = re.compile(r"(?:unpatentable\s+over|obvious\s+over|anticipated\s+by|anticipated\s+over)\s+", re.I)
 REF_SPLIT = re.compile(r"\b(?:further\s+)?in\s+view\s+of\b|\band\s+(?:further\s+)?(?:in\s+view\s+of\s+)?(?=[A-Z])|;|"
                        r"\bas\s+evidenced\s+by\b", re.I)
 # 'Yanagawa '451' style shorthand
@@ -158,14 +157,17 @@ def reference_index(text):
             by_name.setdefault(name.lower(), "GRANT")
     # every reference named in a rejection statement ("over Chen (WO ...) in view of Lee (US 2019/...)"):
     # a named reference that is not a US publication becomes OTHER, so its citations are never credited to one
-    for m in STATEMENT_REFS.finditer(text):
-        for chunk in REF_SPLIT.split(m.group(1)):
-            names = [w.group(0) for w in CAP.finditer(chunk) if w.group(0).lower() not in STOP_WORDS]
+    for m in STATEMENT_START.finditer(text):
+        body = text[m.end():m.end() + 700]
+        body = body[:sentence_bounds(body, 0)[1]]
+        for chunk in REF_SPLIT.split(body):
+            head = re.split(r"[(\[]|(?<!\d)(?:19|20)\d\d\s*[/\-]?\s*\d{7}", chunk)[0]
+            names = [w.group(0) for w in CAP.finditer(head) if w.group(0).lower() not in STOP_WORDS]
             if not names:
                 continue
             pubs = [norm_pub(x.group(1) + x.group(2)) for x in PUB.finditer(chunk) if not is_foreign(chunk, x.start())]
             pubs = [x for x in pubs if x]
-            by_name.setdefault(names[0].lower(), pubs[0] if len(pubs) == 1 else "OTHER")
+            by_name.setdefault(names[-1].lower(), pubs[0] if len(pubs) == 1 else "OTHER")
     return by_name, by_suffix
 
 
@@ -466,20 +468,45 @@ ATTACH_GAP = re.compile(r"^[\s,:;(\[]*(?:et\s+al\.?[\s,]*)?(?:[‘’'`]\s*\d{3}
 WIDE = re.compile(r"(\d{1,5})\s*\]?\s*(?:-|–|to|through)\s*(?:¶+\s*|\[\s*)?(\d{1,5})")
 
 
+ABBREV = re.compile(r"(?:\bal|\bFigs?|\bNo|\bNos|U\.S|\be\.g|\bi\.e|\bcol|\bcols|\bpara|\bparas|\bPat|\bPub|\bAppl|"
+                    r"\bSer|\bPubl|\bvs|\bInc|\bCorp|\bLtd|\bCo|\bet|\bpg|\bpp|\bp|\bref|\bDr|\bMr|\bSec|\bApp|\bEd)$", re.I)
+
+
+def sentence_bounds(seg, pos):
+    """Start and end of the sentence holding pos. A sentence ends at a line break, or at '. ' before a capital
+    letter that does not follow an abbreviation (al., Fig., No., U.S., col., ...)."""
+    start = 0
+    for m in re.finditer(r"\n|\.(?=\s+[A-Z(\[])", seg[:pos]):
+        if m.group(0) == "." and ABBREV.search(seg[max(0, m.start() - 6):m.start()]):
+            continue
+        start = m.end()
+    end = len(seg)
+    for m in re.finditer(r"\n|\.(?=\s+[A-Z(\[]|\s*$)", seg[pos:]):
+        if m.group(0) == "." and ABBREV.search(seg[max(0, pos + m.start() - 6):pos + m.start()]):
+            continue
+        end = pos + m.start()
+        break
+    return start, end
+
+
 def strict_attach(seg, pos, refs, ends):
-    """The reference named immediately before a citation, with nothing but connective words between them
-    ('Smith ¶ [0024]', 'Smith (para 24)', 'Smith et al. teaches at paragraph 24'). None if there is no such name."""
+    """The reference a citation belongs to, or None if that is not certain. Certain means either
+    (a) the reference is named immediately before the citation with only connective words between
+        ('Smith ¶ [0024]', 'Smith (para 24)', 'Smith et al. teaches at paragraph 24'), or
+    (b) the citation's own sentence names exactly one reference, and names it before the citation
+        ('Smith discloses a widget comprising a gear and a spring (para 24).')."""
     before = [r for r in refs if r[0] <= pos]
-    if not before:
-        return None
-    p, pub = before[-1]
-    end = ends.get(p, p)
-    gap = seg[end:pos]
-    if len(gap) > NEAR or "\n" in gap or re.search(r"[.;]\s", gap):
-        return None
-    if not ATTACH_GAP.match(gap):
-        return None
-    return pub
+    if before:
+        p, pub = before[-1]
+        gap = seg[ends.get(p, p):pos]
+        if len(gap) <= NEAR and "\n" not in gap and not re.search(r"[.;]\s", gap) and ATTACH_GAP.match(gap):
+            return pub
+    a, b = sentence_bounds(seg, pos)
+    in_sentence = {pub for p, pub in refs if a <= p < b}
+    named_before = [pub for p, pub in refs if a <= p <= pos]
+    if len(in_sentence) == 1 and named_before:
+        return named_before[-1]
+    return None
 
 
 def parse_office_action_strict(text):
