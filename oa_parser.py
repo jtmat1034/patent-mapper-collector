@@ -24,6 +24,7 @@ NAME_THEN_PUB = re.compile(
 # paragraph, so they are tracked only to keep their citations from being credited to a publication.
 GRANTED = re.compile(r"(?<![\d,/.])(?:\d{1,2},\d{3},\d{3}|(?<=US)\s?\d{7,8}(?=\s*B\d)|(?<=US )\d{7,8}(?=\s*B\d))(?![\d,])")
 # the reference list of a rejection statement, split into one chunk per reference
+DOC_NUMBER = re.compile(r"\d[\d,]{5,}|\b(?:WO|JP|EP|CN|KR|DE|FR|GB|TW)\s*[-:]?\s*\d|\bPat(?:ent)?\.?\s*No", re.I)
 STATEMENT_START = re.compile(r"(?:unpatentable\s+over|obvious\s+over|anticipated\s+by|anticipated\s+over)\s+", re.I)
 REF_SPLIT = re.compile(r"\b(?:further\s+)?in\s+view\s+of\b|\band\s+(?:further\s+)?(?:in\s+view\s+of\s+)?(?=[A-Z])|;|"
                        r"\bas\s+evidenced\s+by\b", re.I)
@@ -167,7 +168,11 @@ def reference_index(text):
                 continue
             pubs = [norm_pub(x.group(1) + x.group(2)) for x in PUB.finditer(chunk) if not is_foreign(chunk, x.start())]
             pubs = [x for x in pubs if x]
-            by_name.setdefault(names[-1].lower(), pubs[0] if len(pubs) == 1 else "OTHER")
+            if len(pubs) == 1:
+                by_name.setdefault(names[-1].lower(), pubs[0])
+            elif pubs or DOC_NUMBER.search(chunk):
+                by_name.setdefault(names[-1].lower(), "OTHER")  # a document that is not one US publication
+            # no number at all ('over Tucker as applied to claim 1 above'): the name says nothing new
     return by_name, by_suffix
 
 
