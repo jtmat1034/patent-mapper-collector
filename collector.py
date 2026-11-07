@@ -299,9 +299,9 @@ def oa_row(rec):
     app = digits(first(rec.get("patentApplicationNumber") or rec.get("applicationNumberText")))
     if len(app) != 8:
         return None, "bad_app_number"
-    labels, quotes = P.parse_office_action_full(text)
-    if not labels:
-        return None, "no_rejection_statement" if P.UNSTATED[0] else "nothing_extracted"
+    labels, quotes, why = P.parse_office_action_strict(text)
+    if why:
+        return None, why
     m = PENDING.search(text)
     pending_max = None
     if m:

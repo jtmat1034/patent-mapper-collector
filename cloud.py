@@ -266,6 +266,8 @@ def candidate_rows(app, pub, kind, doc, db):
     links = sorted({C.digits(x) for x in C.REL_DOC.findall(rel.group(0))} - {"", app}) if rel else []
     rows = []
     quotes = a.get("quotes") or {}
+    if any(r == pub for v in a["labels"].values() for r, _ in v):
+        return [], "cites_own_publication"  # the 'reference' is the application's own publication
     for k, answers in a["labels"].items():
         if k not in cl:
             continue

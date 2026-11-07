@@ -8,7 +8,7 @@ on:
         description: "test = check the API key and real file formats; run = build"
         default: run
         type: choice
-        options: [run, test, spotcheck, rejoin, auditdump]
+        options: [run, test, spotcheck, rejoin, auditdump, auditeval]
       pub_files:
         description: "test mode: which publication files to check (0 = oldest, -1 = newest)"
         default: "-1"
@@ -70,9 +70,16 @@ jobs:
           tar czf audit_batches.tgz batches
           base64 -w 2000 audit_batches.tgz | sed 's/^/AUDITB64:/'
           sha256sum audit_batches.tgz
+      - name: Re-parse the audited office actions with the current parser
+        if: ${{ github.event.inputs.mode == 'auditeval' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -c "import cloud; s=cloud.HFStore(); s.get('audit/audit.jsonl.gz', '.')"
+          python tools/auditeval.py audit/audit.jsonl.gz
       - name: Build
         id: build
-        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' && github.event.inputs.mode != 'rejoin' && github.event.inputs.mode != 'auditdump' }}
+        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'spotcheck' && github.event.inputs.mode != 'rejoin' && github.event.inputs.mode != 'auditdump' && github.event.inputs.mode != 'auditeval' }}
         env:
           USPTO_API_KEY: ${{ secrets.USPTO_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

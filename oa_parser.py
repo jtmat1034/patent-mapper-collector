@@ -9,7 +9,7 @@ Main entry point: parse_office_action(text) -> {claim_number: set((ref, paragrap
 import re
 from collections import OrderedDict
 
-VERSION = 7  # bump when labels change; the cloud run then re-parses every office-action file
+VERSION = 8  # bump when labels change; the cloud run then re-parses every office-action file
 
 # --- reference numbers ----------------------------------------------------------------
 
@@ -123,9 +123,21 @@ def is_foreign(text, start):
     return bool(FOREIGN_BEFORE.search(text[max(0, start - 10):start]))
 
 
+class _Index(dict):
+    """name -> reference; a name that would point at two different references becomes AMBIG."""
+
+    def setdefault(self, k, v):
+        if k in self and self[k] != v:
+            both_non_answers = self[k] in ("OTHER", "GRANT", "AAPA") and v in ("OTHER", "GRANT", "AAPA")
+            if not both_non_answers:
+                self[k] = "AMBIG"
+            return self[k]
+        return dict.setdefault(self, k, v)
+
+
 def reference_index(text):
     """Map lower-cased inventor names / aliases and 3-digit suffixes to publication numbers."""
-    by_name, by_suffix = {}, {}
+    by_name, by_suffix = _Index(), _Index()
     for m in PUB.finditer(text):
         pub = norm_pub(m.group(1) + m.group(2))
         if not pub:
@@ -443,6 +455,107 @@ def parse_office_action_full(text, strict=True):
                 UNSTATED[0] += 1
     used = {p for v in labels.values() for p in v}
     return labels, {k: v for k, v in quotes.items() if k in used}
+
+
+# --- strict parser: no fallbacks; any ambiguity anywhere drops the whole office action ---------
+
+NON_ANSWER = ("AAPA", "GRANT", "OTHER")
+ATTACH_GAP = re.compile(r"^[\s,:;(\[]*(?:et\s+al\.?[\s,]*)?(?:[‘’'`]\s*\d{3}[\s,]*)?(?:\([^)]{0,40}\)[\s,]*)?"
+                        r"(?:(?:at|in|see|e\.g\.,?|i\.e\.,?|teaches|discloses|shows|describes|recites|para(?:graph)?s?\.?|¶+|"
+                        r"[A-Za-z]+\.?\s+\d+[A-Za-z]?,?)\s*)*$", re.I)
+WIDE = re.compile(r"(\d{1,5})\s*\]?\s*(?:-|–|to|through)\s*(?:¶+\s*|\[\s*)?(\d{1,5})")
+
+
+def strict_attach(seg, pos, refs, ends):
+    """The reference named immediately before a citation, with nothing but connective words between them
+    ('Smith ¶ [0024]', 'Smith (para 24)', 'Smith et al. teaches at paragraph 24'). None if there is no such name."""
+    before = [r for r in refs if r[0] <= pos]
+    if not before:
+        return None
+    p, pub = before[-1]
+    end = ends.get(p, p)
+    gap = seg[end:pos]
+    if len(gap) > NEAR or "\n" in gap or re.search(r"[.;]\s", gap):
+        return None
+    if not ATTACH_GAP.match(gap):
+        return None
+    return pub
+
+
+def parse_office_action_strict(text):
+    """(labels, quotes, None) or ({}, {}, reason). Every paragraph citation inside a 102/103 claim section must be
+    attached by name to exactly one known reference and to unambiguous claims, or the office action is dropped."""
+    if not text:
+        return {}, {}, "no_text"
+    import bisect
+    by_name, by_suffix = reference_index(text)
+    all_ends = {}
+    all_refs = mentions(text, by_name, by_suffix, all_ends)
+    ref_pos = [p for p, _ in all_refs]
+    events = context_events(text)
+    ev_pos = [e[0] for e in events]
+    heads = list(SECTION_HEAD.finditer(text))
+    stated = rejected_claims(text)
+    labels, quotes = OrderedDict(), {}
+    for i, h in enumerate(heads):
+        k = bisect.bisect_left(ev_pos, h.start())
+        if k == 0 or events[k - 1][1] not in ("102", "103"):
+            continue
+        seg_end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        if k < len(ev_pos) and ev_pos[k] < seg_end:
+            seg_end = ev_pos[k]
+        claims = claim_numbers(h.group(1))
+        seg = cut_at_next_claim(text[h.start():seg_end], claims, h.end() - h.start())
+        a, b = bisect.bisect_left(ref_pos, h.start()), bisect.bisect_left(ref_pos, h.start() + len(seg))
+        refs = [(p - h.start(), pub) for p, pub in all_refs[a:b]]
+        ends = {p - h.start(): all_ends[p] - h.start() for p, _ in all_refs[a:b]}
+        cites = paragraph_cites(seg)
+        if not cites:
+            continue
+        if not refs:
+            return {}, {}, "section_names_no_reference"
+        specific = len(claims) > 1 and any(clause_claims(seg, pos, claims) for pos, _, _ in cites)
+        per_claim = {}
+        for pos, nums, run_end in cites:
+            if self_citation(seg, pos, run_end):
+                continue  # recognised: the action's own paragraphs or the applicant's disclosure
+            s0 = max(seg.rfind(".", 0, pos - 1), seg.rfind("\n", 0, pos))
+            s1 = seg.find(".", pos + 1)
+            if NEGATIVE.search(seg[s0 + 1:s1 if s1 > 0 else len(seg)]):
+                continue  # recognised: a 'does not teach' sentence
+            pub = strict_attach(seg, pos, refs, ends)
+            if pub is None:
+                return {}, {}, "citation_without_named_reference"
+            if pub == "AMBIG":
+                return {}, {}, "reference_name_ambiguous"
+            if unknown_name_before(seg, pos, by_name):
+                return {}, {}, "unknown_name_beside_citation"
+            if pub in NON_ANSWER:
+                continue  # clearly another kind of reference (granted, foreign, admitted art): not an answer
+            for m in WIDE.finditer(seg[pos:run_end]):
+                lo, hi = int(m.group(1)), int(m.group(2))
+                if hi < lo or hi - lo + 1 > STRICT_MAX_SPAN:
+                    return {}, {}, "vague_paragraph_range"
+            nums = [n for n in nums if 0 < n < 2000]
+            if not nums:
+                return {}, {}, "unreadable_paragraph_number"
+            named = clause_claims(seg, pos, claims) if len(claims) > 1 else set()
+            if specific and not named:
+                return {}, {}, "citation_claim_unclear"
+            for c in named or claims:
+                per_claim.setdefault(c, set()).update((pub, n) for n in nums)
+            q = quote_near(seg, pos, run_end)
+            if q and len(nums) == 1:
+                quotes.setdefault((pub, nums[0]), q)
+        for c, pairs in per_claim.items():
+            if c in stated:
+                labels.setdefault(c, set()).update(pairs)
+            else:
+                return {}, {}, "claim_not_in_rejection_statement"
+    if not labels:
+        return {}, {}, "nothing_extracted"
+    used = {p for v in labels.values() for p in v}
+    return labels, {k: v for k, v in quotes.items() if k in used}, None
 
 
 # --- allowable claims (the "no reference" class) ---------------------------------------
