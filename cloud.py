@@ -205,11 +205,29 @@ def run_oact(store, st, cfg, tmp):
 # --- stage 2 ------------------------------------------------------------------------------------
 
 STATE_SKIPPED = [None]  # skipped office-action files, set by run_appxml from the state
+STATE = [None]  # the run state, so work files left over from an older build or a skipped week are never read
+
+
+def current(paths, done_key, skipped_key):
+    """Only work files written by this build: their weekly file is done and was not skipped."""
+    st = STATE[0]
+    if st is None:
+        return paths
+    skipped = {x[0] if isinstance(x, list) else x for x in st.get(skipped_key) or []}
+    ok = set(st.get(done_key) or []) - skipped
+    keep = []
+    for p in paths:
+        name = os.path.basename(p)[:-len(".jsonl.gz")] if p.endswith(".jsonl.gz") else None
+        if name in ok:
+            keep.append(p)
+        else:
+            os.remove(p)
+    return keep
 
 
 def label_db(store, tmp):
     """All office-action labels in a local SQLite table: earliest action per application."""
-    paths = store.get_prefix("work/labels/", os.path.join(tmp, "dl"))
+    paths = current(store.get_prefix("work/labels/", os.path.join(tmp, "dl")), "oact_done", "oact_skipped")
     db = sqlite3.connect(os.path.join(tmp, "labels.sqlite"))
     db.execute("CREATE TABLE IF NOT EXISTS a (app TEXT PRIMARY KEY, date TEXT, row TEXT)")
     for p in paths:
@@ -286,8 +304,8 @@ def run_appxml(store, st, cfg, tmp):
     STATE_SKIPPED[0] = st.get("oact_skipped")
     db, apps, pubs = label_db(store, tmp)
     C.log("Need claims for %d applications, paragraphs for %d cited publications" % (len(apps), len(pubs)))
-    have = set()
-    for p in store.get_prefix("work/index/", os.path.join(tmp, "dl")):
+    have = set()  # cited publications whose paragraphs this build already saved
+    for p in current(store.get_prefix("work/index/", os.path.join(tmp, "dl")), "appxml_done", "appxml_skipped"):
         with gzip.open(p, "rt") as f:
             for line in f:
                 try:
@@ -300,6 +318,8 @@ def run_appxml(store, st, cfg, tmp):
     todo = [f for f in files if f["fileName"] not in st["appxml_done"]]
     C.log("Publications (%s): %d of %d archive files left" % (pid, len(todo), len(files)))
     pending, avg = {}, 180.0
+    remote = set(store.files("work/candidates/") + store.files("work/index/") + store.files("corpus/"))
+    stale_remote = set()
     for f in todo:
         if time_left() < max(900, 3 * avg):
             break
@@ -334,7 +354,7 @@ def run_appxml(store, st, cfg, tmp):
                     if app in apps:
                         n["examined_apps"] += 1
                         if why != "ok":
-                            n[why] += 1
+                            n[why] = n.get(why, 0) + 1
                         for r in rows:
                             fc.write(json.dumps(r) + "\n")
                         n["claim_rows"] += len(rows)
@@ -359,19 +379,22 @@ def run_appxml(store, st, cfg, tmp):
                     os.remove(x)
             for k in ("work/candidates/", "work/index/", "corpus/"):
                 pending.pop(k + base, None)
+                if k + base in remote:
+                    stale_remote.add(k + base)  # left by an older build: remove it so it can never be read
             st["appxml_done"].append(f["fileName"])
             st.setdefault("appxml_skipped", []).append(f["fileName"])
             continue
         if len(pending) >= 3 * COMMIT_EVERY:
             pending["state/state.json"] = state_file(st, tmp)
-            store.put(pending, "publications through %s" % f["fileName"])
+            store.put(pending, "publications through %s" % f["fileName"], delete=sorted(stale_remote))
+            stale_remote = set()
             for p in pending.values():
                 if os.path.exists(p) and not p.endswith("state_out.json"):
                     os.remove(p)
             pending = {}
-    if pending:
+    if pending or stale_remote:
         pending["state/state.json"] = state_file(st, tmp)
-        store.put(pending, "publications")
+        store.put(pending, "publications", delete=sorted(stale_remote))
     db.close()
     return len(st["appxml_done"]) == len(files)
 
@@ -490,7 +513,7 @@ def check_quotes(store, cand, tmp):
 def run_final(store, st, tmp):
     C.log("Final join ...")
     index = {}
-    for p in store.get_prefix("work/index/", os.path.join(tmp, "dl")):
+    for p in current(store.get_prefix("work/index/", os.path.join(tmp, "dl")), "appxml_done", "appxml_skipped"):
         with gzip.open(p, "rt") as f:
             for line in f:
                 try:
@@ -499,7 +522,7 @@ def run_final(store, st, tmp):
                     continue
                 index.setdefault(pub, spec)
         os.remove(p)
-    cand = store.get_prefix("work/candidates/", os.path.join(tmp, "cand"))
+    cand = current(store.get_prefix("work/candidates/", os.path.join(tmp, "cand")), "appxml_done", "appxml_skipped")
     fam, best = C.Families(), {}
     for p in cand:  # pass 1: families, and which publication of each application to use (A1 first)
         with gzip.open(p, "rt") as f:
@@ -610,6 +633,10 @@ def main(store=None):
     if st.get("parser") != C.P.VERSION:  # labels were made by an older parser: redo them (files are overwritten)
         C.log("Parser version changed (%s -> %s): re-parsing all office actions" % (st.get("parser"), C.P.VERSION))
         st.update({"parser": C.P.VERSION, "oact_done": [], "appxml_done": [], "final_done": False})
+    if st.get("build") != 2:  # build 1 reused an older build's paragraph index and leaked its skipped weeks: redo stage 2
+        C.log("Build fix: redoing the publication stage (office-action labels are kept)")
+        st.update({"build": 2, "appxml_done": [], "appxml_skipped": [], "final_done": False})
+    STATE[0] = st
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         print(json.dumps({"oact_done": len(st["oact_done"]), "appxml_done": len(st["appxml_done"]),
                           "final_done": st["final_done"]}))
